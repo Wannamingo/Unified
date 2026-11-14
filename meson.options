@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: MIT
+
+option(
+  'measurement',
+  type : 'boolean',
+  value : false,
+  description : 'Measurement build: a call to an unimplemented entry point ' +
+                'that returns void aborts the process instead of being ' +
+                'logged and skipped.',
+)
+
+option(
+  'unified_api12_lab',
+  type : 'boolean',
+  value : false,
+  description : 'Private Vulkan1.2/SPIRV1.5 admission lab on v9/v11; not release conformance. Default stays Vulkan1.1.',
+)

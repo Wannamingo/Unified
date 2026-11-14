@@ -1,0 +1,793 @@
+/*
+ * SPDX-FileCopyrightText: 2026 ARMSX2 and bmdhacks
+ * SPDX-License-Identifier: MIT
+ */
+
+/*
+ * VkImage and VkImageView: layout choice, memory requirements, binding,
+ * subresource layouts. Render targets and depth buffers are AFBC where
+ * every path that touches them can handle it; other images are 16x16
+ * u-interleaved unless linear is asked for or tiling cannot help.
+ */
+
+#include "mali_vk.h"
+
+#ifndef __ANDROID__
+/* The WSI's image create info (WSI_IMAGE_CREATE_INFO_MESA): a VK_KHR_display
+ * swapchain image must be laid out so the display can scan it out. */
+#include "wsi_common.h"
+#endif
+#include "mali_image.h"
+#include "mali_android_buffer.h"
+#include "mali_memory.h"
+#include "mali_wsi.h"
+#include "mali_cmd_gfx.h"
+
+#include <stdlib.h>
+
+#include "drm-uapi/drm_fourcc.h"
+#include "util/format/u_format.h"
+#include "util/log.h"
+#include "util/u_atomic.h"
+#include <string.h>
+#include "vk_format.h"
+#include "vk_util.h"
+
+/* Whether an image's memory is shared outside the device: external memory,
+ * a swapchain image or an Android native buffer. Other processes and the
+ * display read and write its bytes directly. */
+static bool
+external_memory(const VkImageCreateInfo *info)
+{
+   if (vk_find_struct_const(info->pNext, EXTERNAL_MEMORY_IMAGE_CREATE_INFO) ||
+       vk_find_struct_const(info->pNext, IMAGE_SWAPCHAIN_CREATE_INFO_KHR))
+      return true;
+#ifdef VK_USE_PLATFORM_ANDROID_KHR
+   if (vk_find_struct_const(info->pNext, NATIVE_BUFFER_ANDROID))
+      return true;
+#endif
+   return false;
+}
+
+/*
+ * AFBC (lossless framebuffer compression) for the images whose memory
+ * traffic is the GPU's own: colour and depth/stencil attachments. Kept to
+ * what ARMSX2 creates (single-sampled 2D, one level, one layer) and to
+ * images nothing reads or writes as raw bytes behind the GPU's back:
+ *
+ *  - no storage (shader image stores cannot write AFBC), no host transfer;
+ *  - no mutable or block-compatible formats and no aliasing: views keep
+ *    the plane's compression mode;
+ *  - every plane's format has an AFBC mode on this arch (not R32 formats,
+ *    for one; v9 has no 16-bit-channel modes);
+ *  - large enough for a header tile (panvk's threshold; smaller images
+ *    gain little).
+ *
+ * Copies, clears and blits into and out of these images go through the
+ * texture unit and the tile buffer (mali_cmd_image.c), never through the
+ * raw compute copy. panvk makes the same choices (panvk_image_can_use_mod,
+ * pan_mod_afbc_test_props).
+ *
+ * v9 and v11. On a G57 at 2x upscaling, uncompressed render targets made
+ * fragment-bound dumps 20-25 % slower than with AFBC.
+ *
+ * v7 has narrower rules of its own, colour attachments only
+ * (v7_can_use_afbc).
+ */
+static bool
+afbc_mode_on_arch(enum mali_afbc_mode mode, unsigned arch)
+{
+   switch (mode) {
+   case MALI_AFBC_NONE:
+      return false;
+   case MALI_AFBC_R16:
+   case MALI_AFBC_R16G16:
+   case MALI_AFBC_R16G16B16A16:
+      /* The 16-bit-channel compression modes start at v10. */
+      return arch >= 10;
+   default:
+      return true;
+   }
+}
+
+static bool
+can_use_afbc(const struct mali_image *image, const enum pipe_format *formats, unsigned arch)
+{
+   const VkImageUsageFlags usage = image->vk.usage | image->vk.stencil_usage;
+   if (!(usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                  VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)))
+      return false;
+   if (usage & (VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_HOST_TRANSFER_BIT))
+      return false;
+   if (image->vk.create_flags & (VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
+                                 VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT |
+                                 VK_IMAGE_CREATE_ALIAS_BIT |
+                                 VK_IMAGE_CREATE_DISJOINT_BIT))
+      return false;
+   if (image->vk.tiling != VK_IMAGE_TILING_OPTIMAL ||
+       image->vk.image_type != VK_IMAGE_TYPE_2D || image->vk.samples != 1 ||
+       image->vk.mip_levels != 1 || image->vk.array_layers != 1)
+      return false;
+   for (unsigned p = 0; p < image->plane_count; p++) {
+      const unsigned min = mali_afbc_min_extent(formats[p]);
+      if (!afbc_mode_on_arch(mali_afbc_mode(formats[p]), arch) ||
+          image->vk.extent.width < min || image->vk.extent.height < min)
+         return false;
+   }
+   return true;
+}
+
+/*
+ * The plane formats v7 AFBC takes here: 8-bit UNORM R, RG and RGBA (sRGB
+ * as a flag on RGBA8), whose component order the v7 texture unit accepts
+ * with AFBC as it is. pan_afbc_format at PAN_ARCH 7 accepts more (RGB565,
+ * RGB5A1, RGBA4, RGB10A2, the BGR orders); those are left uncompressed
+ * here. The BGR orders also need pan_texture_afbc_reswizzle, with the
+ * sampler border colours swizzled to match (panvk_vX_sampler.c).
+ */
+static bool
+v7_afbc_format(enum pipe_format f)
+{
+   switch (f) {
+   case PIPE_FORMAT_R8_UNORM:
+   case PIPE_FORMAT_R8G8_UNORM:
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+   case PIPE_FORMAT_R8G8B8A8_SRGB:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/*
+ * AFBC on v7 (panvk_image_can_use_mod and pan_mod_afbc_test_props at
+ * PAN_ARCH 7, narrowed): a single-plane 2D colour attachment in a format
+ * of v7_afbc_format, optimal tiling, single-sampled, one level and one
+ * layer, at least half a header tile each way. Not for images whose bytes
+ * are read or written uncompressed (storage, host transfer, external
+ * memory, swapchain and Android native buffers), nor for mutable,
+ * block-compatible or aliased ones (v7 cannot read an AFBC plane in
+ * another format), nor for disjoint or sparse ones.
+ */
+static bool
+v7_can_use_afbc(const struct mali_image *image, const enum pipe_format *formats,
+                const VkImageCreateInfo *info)
+{
+   const VkImageUsageFlags usage = image->vk.usage | image->vk.stencil_usage;
+   if (!(usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) ||
+       (usage & (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                 VK_IMAGE_USAGE_HOST_TRANSFER_BIT)))
+      return false;
+   if (image->plane_count != 1 || vk_format_is_depth_or_stencil(image->vk.format) ||
+       !v7_afbc_format(formats[0]))
+      return false;
+   if (image->vk.create_flags &
+       (VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT |
+        VK_IMAGE_CREATE_ALIAS_BIT | VK_IMAGE_CREATE_DISJOINT_BIT |
+        VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
+        VK_IMAGE_CREATE_SPARSE_ALIASED_BIT))
+      return false;
+   if (image->vk.tiling != VK_IMAGE_TILING_OPTIMAL ||
+       image->vk.image_type != VK_IMAGE_TYPE_2D || image->vk.samples != 1 ||
+       image->vk.mip_levels != 1 || image->vk.array_layers != 1)
+      return false;
+   if (external_memory(info))
+      return false;
+   const unsigned min = mali_afbc_min_extent(formats[0]);
+   return image->vk.extent.width >= min && image->vk.extent.height >= min;
+}
+
+/*
+ * The layout of an image, by panvk's rules for the modifiers we use
+ * (panvk_image_can_use_mod, pan_mod_u_tiled_test_props):
+ *
+ * - DRM_FORMAT_MOD_LINEAR for DRM format modifier tiling, the only
+ *   modifier offered (mali_formats.c; checked in mali_CreateImage);
+ * - AFBC when can_use_afbc says so (v7_can_use_afbc on v7);
+ * - linear when the application asks for linear tiling, for 1D images,
+ *   and when the base level is a single texel wide or high (tiling cannot
+ *   help then);
+ * - linear for a compressed image that may be viewed with an uncompressed
+ *   format (BLOCK_TEXEL_VIEW_COMPATIBLE): u-interleaving differs between
+ *   the two;
+ * - 16x16 u-interleaved otherwise.
+ */
+static uint64_t
+choose_modifier(const struct mali_image *image, const enum pipe_format *formats, unsigned arch,
+                const VkImageCreateInfo *info)
+{
+   /* A scanout buffer (a VK_KHR_display swapchain image): the kernel and
+    * the GPU have to agree on the layout, and only linear (or a DRM
+    * modifier the display's plane lists) qualifies. */
+   if (image->wsi_scanout || image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
+      return DRM_FORMAT_MOD_LINEAR;
+   if (!(image->vk.external_handle_types & MALI_EXTERNAL_FD_TYPES) &&
+       (arch == 7 ? v7_can_use_afbc(image, formats, info) : can_use_afbc(image, formats, arch)))
+      return mali_afbc_can_ytr(formats[0]) ? MALI_MOD_AFBC_YTR : MALI_MOD_AFBC;
+   if (image->vk.tiling == VK_IMAGE_TILING_LINEAR ||
+       image->vk.image_type == VK_IMAGE_TYPE_1D ||
+       image->vk.extent.width < 2 || image->vk.extent.height < 2)
+      return DRM_FORMAT_MOD_LINEAR;
+   if (vk_format_is_compressed(image->vk.format) &&
+       (image->vk.create_flags & VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT))
+      return DRM_FORMAT_MOD_LINEAR;
+   return DRM_FORMAT_MOD_ARM_16X16_BLOCK_U_INTERLEAVED;
+}
+
+/*
+ * Which images get a CRC table for transaction elimination.
+ * panvk_should_checksum's rules, plus the ones our CRC handling needs:
+ *
+ * - optimal tiling (u-interleaved): a linear image can be written through
+ *   a host mapping behind the CRC's back;
+ * - a single-sampled, single-layer 2D colour attachment of at most 4 bytes
+ *   per pixel (panvk's limit); the CRC covers level 0 only;
+ * - nothing that writes it outside render passes and copies: no storage
+ *   or host-transfer usage, no depth/stencil usage;
+ * - no mutable format (views of another format would write the same
+ *   memory with other bits), no aliasing flag, no sparse binding;
+ * - no external or swapchain memory (other processes write it) and no
+ *   transient attachment (lazily allocated memory has no CPU mapping to
+ *   initialize the CRC state through).
+ */
+bool
+mali_image_wants_crc(const VkImageCreateInfo *info, uint64_t modifier)
+{
+   /* AFBC targets can carry CRC on v11 (panvk's pan_image_view_can_crc:
+    * sparse AFBC whose superblock fits a tile; ours are 16x16 sparse, and a
+    * pass only uses CRC with tiles of 16x16 or more). */
+   if ((modifier != DRM_FORMAT_MOD_ARM_16X16_BLOCK_U_INTERLEAVED &&
+        !mali_mod_is_afbc(modifier)) ||
+       info->imageType != VK_IMAGE_TYPE_2D || info->arrayLayers != 1 ||
+       info->samples != VK_SAMPLE_COUNT_1_BIT || info->extent.depth != 1)
+      return false;
+   if (!(info->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) ||
+       (info->usage & (VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                       VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT |
+                       VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT)))
+      return false;
+   if (info->flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
+                      VK_IMAGE_CREATE_ALIAS_BIT))
+      return false;
+   if (external_memory(info))
+      return false;
+   if (vk_format_is_depth_or_stencil(info->format) || vk_format_is_compressed(info->format) ||
+       vk_format_get_plane_count(info->format) != 1)
+      return false;
+   return vk_format_get_blocksize(info->format) <= 4;
+}
+
+static VkResult
+image_init_layout(struct mali_device *dev, struct mali_image *image,
+                  const VkImageCreateInfo *pCreateInfo)
+{
+   struct mali_physical_device *pdev = mali_device_physical(dev);
+   VkResult result;
+   /* Swapchain images (VkNativeBufferANDROID) are laid out and bound
+    * below; typed AHB images use dedicated imported storage. DRM modifier tiling
+    * takes DRM_FORMAT_MOD_LINEAR from a list, or explicitly with the
+    * exporter's row stride and offset for one plane (the WSI layer's
+    * imports). */
+   const VkImageDrmFormatModifierExplicitCreateInfoEXT *mod_explicit = NULL;
+   if (pCreateInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
+      const VkImageDrmFormatModifierListCreateInfoEXT *mod_list =
+         vk_find_struct_const(pCreateInfo->pNext, IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT);
+      mod_explicit = vk_find_struct_const(pCreateInfo->pNext,
+                                          IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT);
+      bool linear = false;
+      if (mod_explicit && mod_list) return VK_ERROR_FORMAT_NOT_SUPPORTED;
+      if (mod_explicit) {
+         if (mod_explicit->drmFormatModifierPlaneCount != 1 || !mod_explicit->pPlaneLayouts)
+            return VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT;
+         linear = mod_explicit->drmFormatModifier == DRM_FORMAT_MOD_LINEAR;
+      } else if (mod_list) {
+         for (uint32_t i = 0; i < mod_list->drmFormatModifierCount; i++)
+            linear |= mod_list->pDrmFormatModifiers[i] == DRM_FORMAT_MOD_LINEAR;
+      }
+      if (!linear)
+         return vk_errorf(dev, VK_ERROR_FORMAT_NOT_SUPPORTED,
+                          "DRM format modifier tiling without DRM_FORMAT_MOD_LINEAR "
+                          "(the only modifier supported)");
+   }
+
+#ifndef __ANDROID__
+   const struct wsi_image_create_info *wsi_info =
+      vk_find_struct_const(pCreateInfo->pNext, WSI_IMAGE_CREATE_INFO_MESA);
+   const bool wsi_scanout = wsi_info && wsi_info->scanout;
+#else
+   const bool wsi_scanout = false;
+#endif
+
+   image->wsi_scanout = wsi_scanout;
+   const VkExternalMemoryImageCreateInfo *external =
+      vk_find_struct_const(pCreateInfo->pNext, EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
+   image->ahb = external && (external->handleTypes &
+      VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID);
+   const bool fd = external && (external->handleTypes & MALI_EXTERNAL_FD_TYPES);
+   const bool drm = pCreateInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+   if ((fd || drm) && (pCreateInfo->imageType != VK_IMAGE_TYPE_2D || pCreateInfo->extent.depth != 1 ||
+       pCreateInfo->mipLevels != 1 || pCreateInfo->arrayLayers != 1 || pCreateInfo->samples != 1 ||
+       !mali_fd_image_format_supported(pCreateInfo->format) ||
+       (pCreateInfo->flags & ~VK_IMAGE_CREATE_ALIAS_BIT) ||
+       (pCreateInfo->usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) ||
+       pCreateInfo->sharingMode != VK_SHARING_MODE_EXCLUSIVE ||
+       (fd && (external->handleTypes & ~MALI_EXTERNAL_FD_TYPES)) ||
+       (fd && (external->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) &&
+        pCreateInfo->tiling == VK_IMAGE_TILING_OPTIMAL))) {
+      result = VK_ERROR_FORMAT_NOT_SUPPORTED; goto fail;
+   }
+   if (fd || drm) {
+      /* Use the same format/usage limits reported to external clients. The
+       * query takes its own stack chain, never a stored create-info pNext. */
+      VkPhysicalDeviceImageDrmFormatModifierInfoEXT mod = {
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
+         .drmFormatModifier = DRM_FORMAT_MOD_LINEAR,
+         .sharingMode = pCreateInfo->sharingMode,
+      };
+      VkPhysicalDeviceExternalImageFormatInfo ext = {
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
+         .pNext = drm ? &mod : NULL,
+         .handleType = fd && (external->handleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) ?
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT : VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
+      };
+      const VkPhysicalDeviceImageFormatInfo2 info = {
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+         .pNext = fd ? (const void *)&ext : (const void *)&mod,
+         .format = pCreateInfo->format, .type = pCreateInfo->imageType,
+         .tiling = pCreateInfo->tiling, .usage = pCreateInfo->usage, .flags = pCreateInfo->flags,
+      };
+      VkImageFormatProperties2 props = {.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2};
+      result = mali_GetPhysicalDeviceImageFormatProperties2(mali_physical_device_to_handle(pdev), &info, &props);
+      if (result != VK_SUCCESS) goto fail;
+      if (!pCreateInfo->extent.width || !pCreateInfo->extent.height ||
+          pCreateInfo->extent.width > props.imageFormatProperties.maxExtent.width ||
+          pCreateInfo->extent.height > props.imageFormatProperties.maxExtent.height) {
+         result = VK_ERROR_FORMAT_NOT_SUPPORTED; goto fail;
+      }
+   }
+   if (image->ahb && (!mali_android_buffer_available() ||
+       pCreateInfo->extent.depth != 1 ||
+       (pCreateInfo->flags & ~(VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT)) ||
+       pCreateInfo->sharingMode != VK_SHARING_MODE_EXCLUSIVE ||
+       (pCreateInfo->usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) ||
+       external->handleTypes != VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID ||
+       pCreateInfo->imageType != VK_IMAGE_TYPE_2D ||
+       pCreateInfo->mipLevels != 1 || pCreateInfo->arrayLayers != 1 || pCreateInfo->samples != 1 ||
+       pCreateInfo->tiling != VK_IMAGE_TILING_OPTIMAL ||
+       !mali_android_hal_format(pCreateInfo->format))) {
+      result = VK_ERROR_FORMAT_NOT_SUPPORTED; goto fail;
+   }
+
+   enum pipe_format formats[MALI_IMAGE_MAX_PLANES];
+   image->plane_count = mali_format_planes(image->vk.format, formats);
+   if (!image->plane_count) {
+      result = vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                         "images of format %d are not supported", image->vk.format);
+      goto fail;
+   }
+   const unsigned arch = mali_device_physical(dev)->arch;
+   image->vk.drm_format_mod = image->ahb ? DRM_FORMAT_MOD_LINEAR : choose_modifier(image, formats, arch, pCreateInfo);
+   /* No CRC on v7 and v9 yet: the job manager cannot update the seed from the
+    * GPU, and the CPU-side seed it needs is not written yet. */
+   const bool crc = !mali_arch_is_jm(arch) &&
+                    mali_image_wants_crc(pCreateInfo, image->vk.drm_format_mod);
+
+   if (mod_explicit && image->plane_count != 1) {
+      result = vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                         "explicit DRM format modifier layout of a %u-plane format",
+                         image->plane_count);
+      goto fail;
+   }
+
+   /* Planes follow each other; each starts 4 KiB aligned (data_size is
+    * rounded so). An explicit layout places the one plane where the
+    * exporter put it. */
+   if (mod_explicit) {
+      const VkSubresourceLayout *p = &mod_explicit->pPlaneLayouts[0];
+      const uint64_t row = p->rowPitch, height = image->vk.extent.height;
+      if (!row || row > UINT32_MAX || row % 64 || p->offset % 64 ||
+          row < (uint64_t)image->vk.extent.width * util_format_get_blocksize(formats[0]) ||
+          height > UINT64_MAX / row || p->offset > UINT64_MAX - row * height - (MALI_IMAGE_ALIGNMENT - 1)) {
+         result = VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT; goto fail;
+      }
+   }
+   uint64_t offset = mod_explicit ? mod_explicit->pPlaneLayouts[0].offset : 0;
+   for (unsigned p = 0; p < image->plane_count; p++) {
+      const VkExtent3D extent = image->vk.extent;
+      const struct mali_image_layout_info info = {
+         .format = formats[p],
+         .modifier = image->vk.drm_format_mod,
+         .width = extent.width,
+         .height = extent.height,
+         .depth = extent.depth,
+         .samples = image->vk.samples,
+         .levels = image->vk.mip_levels,
+         .layers = image->vk.array_layers,
+         .crc = crc && p == 0,
+         .explicit_row_stride = mod_explicit ? mod_explicit->pPlaneLayouts[0].rowPitch : 0,
+      };
+      image->planes[p].format = formats[p];
+      if ((mod_explicit && (!info.explicit_row_stride ||
+                            mod_explicit->pPlaneLayouts[0].rowPitch > UINT32_MAX)) ||
+          !mali_image_plane_layout_init(&info, offset, &image->planes[p].layout)) {
+         result = vk_errorf(dev, mod_explicit ? VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT
+                                              : VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                            "no layout for plane %u of a %ux%ux%u image of format %d%s", p,
+                            info.width, info.height, info.depth, image->vk.format,
+                            mod_explicit ? " with the explicit DRM format modifier layout" : "");
+         goto fail;
+      }
+      offset = image->planes[p].layout.slices[0].offset + image->planes[p].layout.data_size;
+   }
+   image->size = offset;
+
+   /* maxResourceSize: an image has to fit one allocation. */
+   if (image->size > pdev->vk.properties.maxMemoryAllocationSize) {
+      result = vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                         "image of %llu bytes is above maxMemoryAllocationSize",
+                         (unsigned long long)image->size);
+      goto fail;
+   }
+
+   return VK_SUCCESS;
+fail:
+   return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+mali_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
+                 const VkAllocationCallbacks *pAllocator, VkImage *pImage)
+{
+   VK_FROM_HANDLE(mali_device, dev, _device);
+   *pImage = VK_NULL_HANDLE;
+   uint64_t external_format = 0;
+#ifdef VK_USE_PLATFORM_ANDROID_KHR
+   VkImageCreateInfo normalized;
+   VkExternalMemoryImageCreateInfo external_memory_info;
+   VkResult normalize = mali_android_external_image_info(dev, pCreateInfo,
+      &normalized, &external_memory_info, &external_format);
+   if (normalize != VK_SUCCESS) return normalize;
+   pCreateInfo = &normalized;
+#endif
+   struct mali_image *image =
+      vk_image_create(&dev->vk, pCreateInfo, pAllocator, sizeof(*image));
+   if (!image)
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+   image->android_external_format = external_format;
+   VkResult result = image_init_layout(dev, image, pCreateInfo);
+   if (result != VK_SUCCESS)
+      goto fail;
+
+#ifdef VK_USE_PLATFORM_ANDROID_KHR
+   /* A swapchain image from the Android loader: the gralloc buffer's
+    * memory, linear with gralloc's stride (mali_wsi.c). */
+   const VkNativeBufferANDROID *nb =
+      vk_find_struct_const(pCreateInfo->pNext, NATIVE_BUFFER_ANDROID);
+   if (nb) {
+      result = mali_android_bind_native_buffer(dev, image, nb, pAllocator);
+      if (result != VK_SUCCESS)
+         goto fail;
+   }
+#endif
+
+   *pImage = mali_image_to_handle(image);
+   return VK_SUCCESS;
+
+fail:
+   vk_image_destroy(&dev->vk, pAllocator, &image->vk);
+   return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+mali_DestroyImage(VkDevice _device, VkImage _image, const VkAllocationCallbacks *pAllocator)
+{
+   VK_FROM_HANDLE(mali_device, dev, _device);
+   VK_FROM_HANDLE(mali_image, image, _image);
+
+   if (!image)
+      return;
+   if (image->wsi_mem)
+      mali_FreeMemory(_device, mali_device_memory_to_handle(image->wsi_mem), pAllocator);
+   vk_image_destroy(&dev->vk, pAllocator, &image->vk);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+mali_GetImageMemoryRequirements2(VkDevice _device, const VkImageMemoryRequirementsInfo2 *pInfo,
+                                 VkMemoryRequirements2 *pMemoryRequirements)
+{
+   VK_FROM_HANDLE(mali_image, image, pInfo->image);
+
+   /* Memory types as the blob: a transient attachment only in lazily
+    * allocated memory, everything else in the host-visible types. No
+    * disjoint planes, so VkImagePlaneMemoryRequirementsInfo does not
+    * apply. */
+   pMemoryRequirements->memoryRequirements = (VkMemoryRequirements) {
+      .size = image->size,
+      .alignment = MALI_IMAGE_ALIGNMENT,
+      .memoryTypeBits = (image->ahb || (image->vk.external_handle_types & MALI_EXTERNAL_FD_TYPES)) ?
+                          (1u << MALI_MEMORY_TYPE_EXTERNAL_CACHED) :
+                       (image->vk.usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) ?
+                           MALI_MEMORY_TYPES_TRANSIENT : MALI_MEMORY_TYPES_HOST_VISIBLE,
+   };
+
+   vk_foreach_struct(stype, ext, pMemoryRequirements->pNext) {
+      switch (stype) {
+      case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS: {
+         /* Only AHB images need a dedicated allocation. */
+         VkMemoryDedicatedRequirements *d = ext;
+         d->prefersDedicatedAllocation = image->ahb;
+         d->requiresDedicatedAllocation = image->ahb;
+         break;
+      }
+      default:
+         vk_debug_ignored_stype(stype);
+         break;
+      }
+   }
+}
+
+/* maintenance4: compute requirements without creating a public image or
+ * importing any storage. Valid query create-info has a supported layout. */
+VKAPI_ATTR void VKAPI_CALL
+mali_GetDeviceImageMemoryRequirements(VkDevice _device,
+   const VkDeviceImageMemoryRequirements *pInfo, VkMemoryRequirements2 *pRequirements)
+{
+   VK_FROM_HANDLE(mali_device, dev, _device);
+   struct mali_image image = {0};
+   const VkImageCreateInfo *create = pInfo->pCreateInfo;
+#ifdef VK_USE_PLATFORM_ANDROID_KHR
+   VkImageCreateInfo normalized;
+   VkExternalMemoryImageCreateInfo external_memory_info;
+   VkResult normalize = mali_android_external_image_info(dev, create,
+      &normalized, &external_memory_info, &image.android_external_format);
+   if (normalize != VK_SUCCESS) {
+      pRequirements->memoryRequirements = (VkMemoryRequirements){0};
+      return;
+   }
+   create = &normalized;
+#endif
+   vk_image_init(&dev->vk, &image.vk, create);
+   VkResult result = image_init_layout(dev, &image, create);
+
+   if (result == VK_SUCCESS) {
+      const VkImageMemoryRequirementsInfo2 info = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+         .image = mali_image_to_handle(&image),
+      };
+      mali_GetImageMemoryRequirements2(_device, &info, pRequirements);
+   } else {
+      /* Deterministic defensive output if a layout is unsupported. Valid
+       * supported create-info follows the exact CreateImage layout path. */
+      pRequirements->memoryRequirements = (VkMemoryRequirements){0};
+      vk_foreach_struct(stype, ext, pRequirements->pNext) {
+         if (stype == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS) {
+            VkMemoryDedicatedRequirements *d = ext;
+            d->prefersDedicatedAllocation = VK_FALSE;
+            d->requiresDedicatedAllocation = VK_FALSE;
+         }
+      }
+   }
+   vk_image_finish(&image.vk);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+mali_GetImageSparseMemoryRequirements2(VkDevice _device,
+   const VkImageSparseMemoryRequirementsInfo2 *pInfo, uint32_t *pCount,
+   VkSparseImageMemoryRequirements2 *pRequirements)
+{
+   /* No sparse binding/residency image creation is exposed. The actual
+    * requirement list for a valid ordinary image is empty; do not touch
+    * caller array or pNext canaries. The legacy common wrapper uses this. */
+   *pCount = 0;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+mali_GetDeviceImageSparseMemoryRequirements(VkDevice _device,
+   const VkDeviceImageMemoryRequirements *pInfo, uint32_t *pCount,
+   VkSparseImageMemoryRequirements2 *pRequirements)
+{
+   /* No sparse image memory model is exposed. */
+   *pCount = 0;
+}
+
+/* The CRC knobs (mali_cmd_gfx.h): here, in code compiled once, so the
+ * render-pass code of every arch reads the same ones. */
+struct mali_crc_options mali_crc_options = {
+   .empty_tile_read = true,
+   .empty_tile_write = true,
+};
+
+/*
+ * Start the image's CRC state from zero: seed 0 and a table of zeros, as
+ * panvk does at bind. Whatever the memory held before (another image's
+ * CRCs, pixels) must not be taken for CRCs of this image's contents. A
+ * CRC of zero is as unlikely as any other 64-bit value. The write goes
+ * through the allocation's CPU mapping; the GPU's L2 is cleaned and
+ * invalidated at the start of every submit, so it sees it. Memory without
+ * a CPU mapping (imports) leaves CRC off.
+ */
+static void
+crc_init(struct mali_device *dev, struct mali_image *image)
+{
+   const struct mali_image_crc_layout *c = &image->planes[0].layout.crc;
+   struct mali_device_memory *mem = image->mem;
+
+   image->crc_header = 0;
+   if (!c->header_offset || !mem->bo.cpu || mem->dmabuf_fd >= 0)
+      return;
+   const uint64_t off = image->mem_offset + c->header_offset;
+   const uint64_t size = MALI_CRC_HEADER_SIZE + c->size;
+   if (off + size > mem->bo.size)
+      return;
+   memset((uint8_t *)mem->bo.cpu + off, 0, size);
+   if (!(mem->props & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+      mali_kbase_bo_flush(dev->kbase, &mem->bo, off, size);
+   image->crc_header = image->base + c->header_offset;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+mali_BindImageMemory2(VkDevice _device, uint32_t bindInfoCount,
+                      const VkBindImageMemoryInfo *pBindInfos)
+{
+   VK_FROM_HANDLE(mali_device, dev, _device);
+   VkResult result = VK_SUCCESS;
+
+   for (uint32_t i = 0; i < bindInfoCount; i++) {
+      VK_FROM_HANDLE(mali_image, image, pBindInfos[i].image);
+      VK_FROM_HANDLE(mali_device_memory, mem, pBindInfos[i].memory);
+      const VkBindMemoryStatus *status =
+         vk_find_struct_const(pBindInfos[i].pNext, BIND_MEMORY_STATUS);
+      VkResult r = VK_SUCCESS;
+
+#ifdef VK_USE_PLATFORM_ANDROID_KHR
+      if (mem && image->ahb) {
+         if (!mem->android_buffer || mem->android_dedicated_image != pBindInfos[i].image ||
+             pBindInfos[i].memoryOffset != 0)
+            r = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+         else
+            r = mali_android_image_layout(image, &mem->android_layout);
+         if (r != VK_SUCCESS) {
+            if (status) *status->pResult = r;
+            result = r; continue;
+         }
+      }
+#endif
+      if (mem) {
+         if (image->vk.external_handle_types & MALI_EXTERNAL_FD_TYPES) {
+            const uint64_t off = pBindInfos[i].memoryOffset;
+            if (mem->dmabuf_fd < 0 || mem->vk.memory_type_index != MALI_MEMORY_TYPE_EXTERNAL_CACHED ||
+                !(image->vk.external_handle_types & (mem->vk.import_handle_type | mem->vk.export_handle_types)) ||
+                off % MALI_IMAGE_ALIGNMENT || off > mem->vk.size || image->size > mem->vk.size - off) {
+               if (status) *status->pResult = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+               result = VK_ERROR_INVALID_EXTERNAL_HANDLE; continue;
+            }
+         }
+         /* No kernel call: the image records where it lives. */
+         image->mem = mem;
+         image->mem_offset = pBindInfos[i].memoryOffset;
+         image->base = mali_device_memory_gpu_va(mem, pBindInfos[i].memoryOffset);
+         const bool first_bind = p_atomic_fetch_add(&mem->binds, 1) == 0;
+         image->fresh = first_bind && mem->dmabuf_fd < 0 && !image->wsi_scanout &&
+                        !image->vk.external_handle_types &&
+                        !(image->vk.create_flags & VK_IMAGE_CREATE_ALIAS_BIT) &&
+                        !(image->vk.usage & ~(VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT));
+         crc_init(dev, image);
+      } else {
+#ifdef VK_USE_PLATFORM_ANDROID_KHR
+         /* An image created with VkImageSwapchainCreateInfoKHR bound to a
+          * swapchain image: the loader adds the gralloc buffer
+          * (VK_ANDROID_native_buffer spec version 8). */
+         const VkNativeBufferANDROID *nb =
+            vk_find_struct_const(pBindInfos[i].pNext, NATIVE_BUFFER_ANDROID);
+         if (nb)
+            r = mali_android_bind_native_buffer(dev, image, nb, NULL);
+         else
+#endif
+            r = vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                          "binding an image without memory");
+      }
+      if (status)
+         *status->pResult = r;
+      if (r != VK_SUCCESS)
+         result = r;
+   }
+   return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+mali_GetImageSubresourceLayout2(VkDevice _device, VkImage _image,
+                                const VkImageSubresource2 *pSubresource,
+                                VkSubresourceLayout2 *pLayout)
+{
+   VK_FROM_HANDLE(mali_image, image, _image);
+   const VkImageSubresource *sub = &pSubresource->imageSubresource;
+   const struct mali_image_plane_layout *pl =
+      &image->planes[mali_image_aspect_plane(image, sub->aspectMask)].layout;
+   const struct mali_image_slice *s = &pl->slices[sub->mipLevel];
+
+   pLayout->subresourceLayout = (VkSubresourceLayout) {
+      .offset = s->offset + sub->arrayLayer * pl->array_stride,
+      .size = s->size,
+      .rowPitch = s->row_stride,
+      .arrayPitch = pl->array_stride,
+      .depthPitch = s->surface_stride,
+   };
+}
+
+/* maintenance5 building block: use the same normalization and layout as
+ * CreateImage, without allocating a public image, importing storage or
+ * touching the GPU. Keep maintenance5 unadvertised until its other
+ * requirements and native coverage are complete. */
+VKAPI_ATTR void VKAPI_CALL
+mali_GetDeviceImageSubresourceLayout(VkDevice _device,
+   const VkDeviceImageSubresourceInfo *pInfo, VkSubresourceLayout2 *pLayout)
+{
+   VK_FROM_HANDLE(mali_device, dev, _device);
+   struct mali_image image = {0};
+   const VkImageCreateInfo *create = pInfo->pCreateInfo;
+#ifdef VK_USE_PLATFORM_ANDROID_KHR
+   VkImageCreateInfo normalized;
+   VkExternalMemoryImageCreateInfo external_memory_info;
+   VkResult normalize = mali_android_external_image_info(dev, create,
+      &normalized, &external_memory_info, &image.android_external_format);
+   if (normalize != VK_SUCCESS) {
+      pLayout->subresourceLayout = (VkSubresourceLayout){0};
+      return;
+   }
+   create = &normalized;
+#endif
+   vk_image_init(&dev->vk, &image.vk, create);
+   VkResult result = image_init_layout(dev, &image, create);
+   if (result == VK_SUCCESS)
+      mali_GetImageSubresourceLayout2(_device, mali_image_to_handle(&image),
+                                     pInfo->pSubresource, pLayout);
+   else
+      pLayout->subresourceLayout = (VkSubresourceLayout){0};
+   vk_image_finish(&image.vk);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+mali_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
+                     const VkAllocationCallbacks *pAllocator, VkImageView *pView)
+{
+   VK_FROM_HANDLE(mali_device, dev, _device);
+   VK_FROM_HANDLE(mali_image, image, pCreateInfo->image);
+   VkImageViewCreateInfo normalized;
+   if (image->android_external_format) {
+      if (pCreateInfo->format != VK_FORMAT_UNDEFINED)
+         return VK_ERROR_FORMAT_NOT_SUPPORTED;
+      normalized = *pCreateInfo;
+      normalized.format = image->vk.format;
+      pCreateInfo = &normalized;
+   }
+
+
+
+   struct mali_image_view *view =
+      vk_image_view_create(&dev->vk, pCreateInfo, pAllocator, sizeof(*view));
+   if (!view)
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   VkResult result =
+      mali_arch_dispatch(mali_device_physical(dev)->arch, image_view_init_descs, dev, view);
+   if (result != VK_SUCCESS) {
+      vk_image_view_destroy(&dev->vk, pAllocator, &view->vk);
+      return result;
+   }
+
+   *pView = mali_image_view_to_handle(view);
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+mali_DestroyImageView(VkDevice _device, VkImageView _view,
+                      const VkAllocationCallbacks *pAllocator)
+{
+   VK_FROM_HANDLE(mali_device, dev, _device);
+   VK_FROM_HANDLE(mali_image_view, view, _view);
+
+   if (!view)
+      return;
+   mali_bo_pool_free(&dev->desc_pool, &view->plane_descs);
+   vk_image_view_destroy(&dev->vk, pAllocator, &view->vk);
+}
