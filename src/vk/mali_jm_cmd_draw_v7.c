@@ -599,7 +599,8 @@ emit_attrib_buf(const struct vk_vertex_binding_state *b, uint32_t stride, uint64
    const uint64_t base = addr & ~63ull;
    const uint32_t bsize = (uint32_t)MIN2(size + (addr & 63), UINT32_MAX);
    const bool per_instance = b->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE;
-   const unsigned divisor = padded_count * b->divisor;
+   /* When the first element covers the whole draw, no multiply or division is needed. */
+   const unsigned divisor = b->divisor < instance_count ? padded_count * b->divisor : 0;
    bool continuation = false;
 
    if (instance_count <= 1) {
@@ -656,17 +657,12 @@ emit_attrib_buf(const struct vk_vertex_binding_state *b, uint32_t stride, uint64
 
 /*
  * A vertex binding of an indirect draw, whose vertex range and instance
- * count are not known here: the patch job (mali_jm_idraw_nir.c) shades
- * instances 2^n vertices apart (n its own), so a per-vertex binding is 1D
- * Modulus by 2^n and a per-instance binding 1D POT Divisor by 2^n times its
- * divisor; the patch job writes n into the byte both share. The attribute
- * unit adds the draw's Offset start to a divided buffer's element as well,
- * so the patch job takes it off the attributes of such a binding
- * (mali_jm_idraw_rec::inst_attr_raw_mask). A divisor of 0
- * reads the first element (1D, stride 0), as for a direct draw. False for a
- * divisor that is not a power of two.
+ * count are not known here. The patch job shades instances P vertices
+ * apart, with P a power of two, and adds log2(P) to the packed R field.
+ * The NPOT mantissa and E depend on the divisor normalized by its own
+ * power of two, so scaling it by P changes neither. See pan_encoder.h.
  */
-static bool
+static void
 emit_attrib_buf_indirect(const struct vk_vertex_binding_state *b, uint32_t stride, uint64_t addr,
                          uint64_t size, unsigned binding, struct mali_jm_idraw_rec *rec,
                          struct mali_attribute_buffer_packed *desc)
@@ -674,31 +670,39 @@ emit_attrib_buf_indirect(const struct vk_vertex_binding_state *b, uint32_t strid
    const uint64_t base = addr & ~63ull;
    const uint32_t bsize = (uint32_t)MIN2(size + (addr & 63), UINT32_MAX);
    const bool per_instance = b->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE;
+   const bool npot = per_instance && !util_is_power_of_two_or_zero(b->divisor);
+   unsigned r = 0, e = 0, numerator = 0;
+   if (npot)
+      numerator = compute_npot_divisor(b->divisor, &r, &e);
+   else if (per_instance && b->divisor)
+      r = util_logbase2(b->divisor);
 
-   if (per_instance && !util_is_power_of_two_or_zero(b->divisor))
-      return false;
    pan_pack(&desc[0], ATTRIBUTE_BUFFER, cfg) {
       cfg.pointer = base;
       cfg.size = bsize;
-      if (!per_instance) {
+      cfg.stride = !per_instance || b->divisor ? stride : 0;
+      if (!per_instance)
          cfg.type = MALI_ATTRIBUTE_TYPE_1D_MODULUS;
-         cfg.stride = stride;
-      } else if (!b->divisor) {
+      else if (!b->divisor)
          cfg.type = MALI_ATTRIBUTE_TYPE_1D;
-         cfg.stride = 0;
-      } else {
-         cfg.type = MALI_ATTRIBUTE_TYPE_1D_POT_DIVISOR;
-         cfg.stride = stride;
-      }
+      else
+         cfg.type = npot ? MALI_ATTRIBUTE_TYPE_1D_NPOT_DIVISOR : MALI_ATTRIBUTE_TYPE_1D_POT_DIVISOR;
    }
-   memset(&desc[1], 0, sizeof(desc[1]));
+   if (npot) {
+      pan_cast_and_pack(&desc[1], ATTRIBUTE_BUFFER_CONTINUATION_NPOT, cfg) {
+         cfg.divisor_numerator = numerator;
+         cfg.divisor = b->divisor;
+      }
+   } else {
+      memset(&desc[1], 0, sizeof(desc[1]));
+   }
+
    if (!per_instance) {
       rec->mod_mask |= BITFIELD_BIT(binding);
    } else if (b->divisor) {
-      rec->pot_mask |= BITFIELD_BIT(binding);
-      rec->pot_shift[binding] = util_logbase2(b->divisor);
+      rec->divisor_mask |= BITFIELD_BIT(binding);
+      rec->divisor_shift[binding] = r | (e << 5);
    }
-   return true;
 }
 
 /*
@@ -757,9 +761,8 @@ emit_attributes(struct mali_cmd_buffer *cmd, const struct mali_graphics_pipeline
    for (unsigned b = 0; b < num_vbs; b++) {
       if ((vi->bindings_valid & BITFIELD_BIT(b)) && d->vb[b].addr) {
          if (rec) {
-            if (!emit_attrib_buf_indirect(&vi->bindings[b], strides[b], d->vb[b].addr,
-                                          d->vb[b].size, b, rec, &bdescs[2 * b]))
-               return false;
+            emit_attrib_buf_indirect(&vi->bindings[b], strides[b], d->vb[b].addr,
+                                     d->vb[b].size, b, rec, &bdescs[2 * b]);
          } else {
             emit_attrib_buf(&vi->bindings[b], strides[b], d->vb[b].addr, d->vb[b].size,
                             di->instance_count, dd->padded_count, &bdescs[2 * b]);
@@ -788,7 +791,7 @@ emit_attributes(struct mali_cmd_buffer *cmd, const struct mali_graphics_pipeline
        * a divisor starts that many elements early. Only an instanced draw
        * divides (emit_attrib_buf); one instance reads with stride 0. */
       int64_t first = per_instance ? (int64_t)di->first_instance : 0;
-      if (per_instance && di->instance_count > 1 && b->divisor)
+      if (per_instance && di->instance_count > 1 && b->divisor && b->divisor < di->instance_count)
          first -= dd->raw_vertex_offset;
       pan_pack(&adescs[i], ATTRIBUTE, cfg) {
          cfg.buffer_index = a->binding * 2;
@@ -1676,13 +1679,8 @@ draw_indirect(struct mali_cmd_buffer *cmd, const struct idraw_call *call, uint32
       goto oom;
    if (own_fau)
       d->dirty |= MALI_GFX_DIRTY_VS_FAU;
-   if (!emit_attributes(cmd, p, &di, &dd, &rec)) {
-      if (vk_command_buffer_has_error(&cmd->vk))
-         return;
-      MALI_V7_UNSUPPORTED("an indirect draw with a vertex attribute divisor that is not a "
-                          "power of two");
+   if (!emit_attributes(cmd, p, &di, &dd, &rec))
       return;
-   }
    if (!emit_varying_bufs(cmd, t, &di, &dd, &rec))
       goto oom;
    struct mali_cmd_slab *arena = mali_v7_idraw_arena(cmd);

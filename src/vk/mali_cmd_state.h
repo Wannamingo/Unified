@@ -65,6 +65,7 @@
 #include "vk_format.h"
 
 #include "pan_format.h"
+#include "pan_encoder.h"
 
 #include "mali_blend.h"
 #include "mali_descriptor_set.h"
@@ -613,10 +614,11 @@ mali_gfx_pack_attrib(const struct vk_vertex_input_state *vi, const uint16_t *str
          cfg.frequency = MALI_ATTRIBUTE_FREQUENCY_INSTANCE;
          cfg.divisor_r = __builtin_ctz(bs->divisor);
       } else {
-         /* Not reachable for ARMSX2 (no divisors); the NPOT magic numbers
-          * are not implemented. */
-         cfg.attribute_type = MALI_ATTRIBUTE_TYPE_1D;
+         /* The ATTRIBUTE reciprocal encoding is shared with PanVK. */
+         cfg.attribute_type = MALI_ATTRIBUTE_TYPE_1D_NPOT_DIVISOR;
          cfg.frequency = MALI_ATTRIBUTE_FREQUENCY_INSTANCE;
+         cfg.divisor_d = pan_compute_npot_divisor(bs->divisor, &cfg.divisor_r,
+                                                  &cfg.divisor_e);
       }
    }
 }

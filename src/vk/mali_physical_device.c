@@ -332,6 +332,7 @@ available_memory(struct mali_physical_device *pdev)
  */
 static const struct vk_device_extension_table mali_device_extensions = {
    .KHR_driver_properties = true,
+   .KHR_vertex_attribute_divisor = true,
    /* Sync-file import and export: the Android loader signals present
     * fences by importing the release fence (swapchain_maintenance1). */
    .KHR_external_fence_fd = true,
@@ -897,6 +898,8 @@ get_features(struct vk_features *f, uint32_t arch)
       .extendedDynamicState2LogicOp = false,
       .extendedDynamicState2PatchControlPoints = false,
       .vertexInputDynamicState = true,
+      .vertexAttributeInstanceRateDivisor = true,
+      .vertexAttributeInstanceRateZeroDivisor = true,
 
       /* VK_KHR_dynamic_rendering_local_read (the table above). */
       .dynamicRenderingLocalRead = true,
@@ -1058,6 +1061,8 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       .lineSubPixelPrecisionBits = 8,     /* same as panvk on this hardware */
       .maxDrawIndexedIndexValue = UINT32_MAX,
       .maxDrawIndirectCount = max_draw_indirect_count_for_arch(pdev->arch),
+      .maxVertexAttribDivisor = UINT16_MAX,
+      .supportsNonZeroFirstInstance = false,
       .maxSamplerLodBias = 126.0f,
       .maxSamplerAnisotropy = 16.0f,
       .maxViewports = 1,

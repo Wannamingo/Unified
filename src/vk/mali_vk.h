@@ -227,7 +227,7 @@ struct mali_jm_idraw_rec {
     * (8-byte descriptors, offset in word 1). */
    uint64_t attribs;
    uint32_t inst_attr_mask;
-   /* v7: of those, the ones whose buffer is a 1D POT Divisor: the attribute
+   /* v7: of those, the ones whose buffer is a 1D POT or NPOT Divisor: the attribute
     * unit adds the draw's Offset start to their element too, so their
     * offset is base + (firstInstance - Offset start) x stride. */
    uint32_t inst_attr_raw_mask;
@@ -237,8 +237,8 @@ struct mali_jm_idraw_rec {
    uint64_t minmax;         /* indexed: the smallest and largest index */
    uint64_t attrib_bufs;    /* the Attribute Buffer table, two per binding */
    uint32_t mod_mask;       /* bindings packed 1D Modulus (per vertex) */
-   uint32_t pot_mask;       /* bindings packed 1D POT Divisor (per instance) */
-   uint32_t pot_shift[MALI_IDRAW_MAX_ATTRIBS];   /* log2 of their divisor */
+   uint32_t divisor_mask;   /* bindings packed POT or NPOT (per instance) */
+   uint32_t divisor_shift[MALI_IDRAW_MAX_ATTRIBS]; /* R and optional E in byte format */
    uint64_t vary_bufs;      /* the varying Attribute Buffers */
    uint32_t vary_stride[3];
    uint32_t vary_max[3];    /* the most vertices that fit the arena at that stride */

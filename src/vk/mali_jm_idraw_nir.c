@@ -433,10 +433,10 @@ MALI_PER_ARCH(build_indirect_draw_nir)(struct mali_device *dev)
       nir_pop_if(&b, NULL);
 
       /* The vertex buffers: a per-vertex binding is 1D Modulus by P, a
-       * per-instance one 1D POT Divisor by P x its divisor; both fields
-       * are the byte at bits 24-31 of the Attribute Buffer's word 1. */
-      nir_def *mod = REC32(&b, rec, mod_mask), *pot = REC32(&b, rec, pot_mask);
-      nir_push_if(&b, nir_ine_imm(&b, nir_ior(&b, mod, pot), 0));
+       * per-instance one POT/NPOT Divisor by P x its divisor. Their R/E fields
+       * share the byte at bits 24-31 of the Attribute Buffer's word 1. */
+      nir_def *mod = REC32(&b, rec, mod_mask), *div = REC32(&b, rec, divisor_mask);
+      nir_push_if(&b, nir_ine_imm(&b, nir_ior(&b, mod, div), 0));
       {
          nir_def *bufs = REC64(&b, rec, attrib_bufs);
          for (unsigned i = 0; i < MALI_IDRAW_MAX_ATTRIBS; i++) {
@@ -444,8 +444,13 @@ MALI_PER_ARCH(build_indirect_draw_nir)(struct mali_device *dev)
             nir_push_if(&b, nir_ine_imm(&b, nir_iand_imm(&b, mod, 1u << i), 0));
             store_byte(&b, lp, bufs, off, 24);
             nir_pop_if(&b, NULL);
-            nir_push_if(&b, nir_ine_imm(&b, nir_iand_imm(&b, pot, 1u << i), 0));
-            store_byte(&b, nir_iadd(&b, lp, REC32_AT(&b, rec, pot_shift, i)), bufs, off, 24);
+            nir_push_if(&b, nir_ine_imm(&b, nir_iand_imm(&b, div, 1u << i), 0));
+            nir_def *shift = REC32_AT(&b, rec, divisor_shift, i);
+            nir_def *r = nir_iadd(&b, lp, nir_iand_imm(&b, shift, 31));
+            /* At saturation the largest shaded offset is still below the
+             * encoded divisor: the draw covers at most 2^26 vertices. */
+            r = nir_umin(&b, r, nir_imm_int(&b, 31));
+            store_byte(&b, nir_ior(&b, r, nir_iand_imm(&b, shift, 32)), bufs, off, 24);
             nir_pop_if(&b, NULL);
          }
       }

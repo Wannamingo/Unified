@@ -14,7 +14,7 @@
 project(
   'Unified',
   ['c', 'cpp'],
-  version : '0.4.51',
+  version : '0.4.53',
   license : 'MIT',
   meson_version : '>= 1.7.0',
   default_options : [
