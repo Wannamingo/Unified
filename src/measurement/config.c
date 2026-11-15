@@ -376,6 +376,7 @@ static const char *const kind_names[MALI_MEASURE_KIND_COUNT] = {
    [MALI_MEASURE_PASS_FRAG] = "pass",
    [MALI_MEASURE_DISPATCH] = "dispatch",
    [MALI_MEASURE_DRAW] = "draw",
+   [MALI_MEASURE_PRELOAD_SYNC] = "preload_sync",
 };
 
 static const char *const sq_names[MALI_SUBQUEUE_COUNT] = {
@@ -430,6 +431,9 @@ mali_measure_row(struct mali_measure *m, const struct mali_measure_cmd *mc,
       snprintf(info, sizeof(info), "count=%u inst=%u %s pass=%u fs=%016" PRIx64 " bs=%x",
                r->info[0], r->info[1], r->info[2] ? "indexed" : "direct", r->info[3],
                r->shader, r->extra);
+      break;
+   case MALI_MEASURE_PRELOAD_SYNC:
+      snprintf(info, sizeof(info), "drain=%u mask=0x%x", r->info[0], r->info[1]);
       break;
    default:
       info[0] = 0;

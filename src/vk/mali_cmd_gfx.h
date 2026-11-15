@@ -242,6 +242,7 @@ struct mali_render_desc {
 struct mali_render_state {
    bool active;
    bool suspended;                /* retained until resume or end-of-CB spill */
+   bool fragment_writes_global;
    /* A draw of the pass copied uniform-buffer words into a FAU block with
     * prebuilt stores the stream builder does not track (emit_ubo_push);
     * flush_tiling waits for them. */

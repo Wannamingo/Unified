@@ -655,6 +655,19 @@ bc_formats_complete(const struct mali_physical_device *pdev)
    return true;
 }
 
+static bool
+packed_4444_formats_complete(const struct mali_physical_device *pdev)
+{
+   const VkFormatFeatureFlags required = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                                        VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+                                        VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+   const VkFormatFeatureFlags argb =
+      mali_format_image_features(pdev, VK_FORMAT_A4R4G4B4_UNORM_PACK16);
+   const VkFormatFeatureFlags abgr =
+      mali_format_image_features(pdev, VK_FORMAT_A4B4G4R4_UNORM_PACK16);
+   return (argb & abgr & required) == required;
+}
+
 /*
  * VkPhysicalDeviceDescriptorIndexingFeatures (VK_EXT_descriptor_indexing on
  * v9 and v11, VK_MALISX2_descriptor_indexing on v7: mali_vk.h).
@@ -1597,6 +1610,14 @@ physical_device_create(struct mali_instance *instance, const char *path,
 
    struct vk_device_extension_table extensions =
       device_extensions_for_arch(pdev->arch);
+
+   /* Keep the feature and format queries consistent. Applications use the
+    * 4444 features to choose the component mapping for sampled views. */
+   if (pdev->arch == 11 && packed_4444_formats_complete(pdev)) {
+      extensions.EXT_4444_formats = true;
+      features.formatA4R4G4B4 = true;
+      features.formatA4B4G4R4 = true;
+   }
 
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
    /* BLOB import stays available without private mapper ABI. Typed RGB images

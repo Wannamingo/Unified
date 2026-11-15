@@ -42,6 +42,7 @@
 #include "mali_queue.h"
 
 #include <errno.h>
+#include <inttypes.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,6 +50,9 @@
 #include <sys/eventfd.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
 
 #include "util/log.h"
 #include "util/os_time.h"
@@ -367,6 +371,18 @@ event_thread_main(void *arg)
 /* ---------------------------------------------------------------------- */
 /* Device                                                                  */
 
+static bool
+preload_option(const char *variable, const char *property)
+{
+   const char *value = getenv(variable);
+#ifdef __ANDROID__
+   char prop[PROP_VALUE_MAX];
+   if (!value && __system_property_get(property, prop) > 0)
+      value = prop;
+#endif
+   return value && !strcmp(value, "1");
+}
+
 VkResult
 mali_csf_device_init(struct mali_device *dev)
 {
@@ -394,6 +410,10 @@ mali_csf_device_init(struct mali_device *dev)
    csf->sb.all_iters_mask = (uint16_t)BITFIELD_RANGE(MALI_SB_ITER_START, csf->sb.iter_count);
 
    csf->shared_sb = dev->kbase->props.gpu_features & 0x8;
+   csf->preload_track = preload_option("UNIFIED_PRELOAD_TRACK", "debug.unified.preload_track");
+   csf->preload_stats = preload_option("UNIFIED_PRELOAD_STATS", "debug.unified.preload_stats");
+   if (csf->preload_stats)
+      mesa_logi("Unified LOAD start track=%u", csf->preload_track);
 
    dev->csf = csf;
    dev->fe = csf;
@@ -1039,6 +1059,15 @@ mali_queue_submit(struct vk_queue *vkq, struct vk_queue_submit *submit)
    /* What later command buffers order against (see ring_order_waits). */
    for (uint32_t c = 0; c < order.n; c++) {
       struct mali_cmd_buffer *cmd = submit_cmd(submit, c);
+      if (unlikely(csf->preload_stats)) {
+         const struct mali_preload_stats *load = &cmd->gfx.preload.stats;
+         q->preload.candidates += load->candidates;
+         q->preload.skipped += load->skipped;
+         q->preload.covered += load->covered;
+         q->preload.unknown += load->unknown;
+         q->preload.overlap += load->overlap;
+         q->preload.full_waits += load->full_waits;
+      }
       if (order.intra && c + 1 < order.n) {
          for (unsigned i = 0; i < MALI_SUBQUEUE_COUNT; i++)
             q->handoff[i] += cmd_has_span(cmd, i);
@@ -1051,6 +1080,15 @@ mali_queue_submit(struct vk_queue *vkq, struct vk_queue_submit *submit)
             q->compute_after_lazy[j] = MAX2(q->compute_after_lazy[j], q->last_signal[j]);
          }
       }
+   }
+
+   if (unlikely(csf->preload_stats) && (seqno == 1 || seqno % 64 == 0)) {
+      const struct mali_preload_stats *load = &q->preload;
+      mesa_logi("Unified LOAD track=%u submit=%" PRIu64 " candidates=%" PRIu64
+                " skipped=%" PRIu64 " covered=%" PRIu64 " unknown=%" PRIu64
+                " overlap=%" PRIu64 " full_waits=%" PRIu64,
+                csf->preload_track, seqno, load->candidates, load->skipped,
+                load->covered, load->unknown, load->overlap, load->full_waits);
    }
 
    /* Signals: pending until every subqueue reaches what it will have

@@ -1,0 +1,12 @@
+--- a/src/panfrost/lib/pan_format.c
++++ b/src/panfrost/lib/pan_format.c
+@@ -334,6 +334,9 @@
+    FMT(B5G5R5X1_UNORM,          RGB5_A1_UNORM,   BGR1, L, VT__IB),
+    FMT(R5G5B5A1_UNORM,          RGB5_A1_UNORM,   RGBA, L, VTR_IB),
+    FMT(B5G5R5A1_UNORM,          RGB5_A1_UNORM,   BGRA, L, VTR_IB),
++   /* A in bit zero. This is a different texture encoding from RGB5_A1. */
++   FMT(A1B5G5R5_UNORM,          A1_BGR5_UNORM,   RGBA, L, _T____),
++   FMT(A1R5G5B5_UNORM,          A1_BGR5_UNORM,   BGRA, L, _T____),
+    FMT(R10G10B10X2_UNORM,       RGB10_A2_UNORM,  RGB1, L, VTR_IB),
+    FMT(B10G10R10X2_UNORM,       RGB10_A2_UNORM,  BGR1, L, VTR_IB),
+    FMT(R10G10B10A2_UNORM,       RGB10_A2_UNORM,  RGBA, L, VTR_IB),

@@ -37,6 +37,7 @@
 /* After mali_cs.h, which sets PAN_ARCH: MALI_PER_ARCH below. */
 #include "mali_arch.h"
 #include "mali_descriptor_set_layout.h"
+#include "mali_queue.h"
 #include "mali_shader.h"
 
 struct mali_descriptor_set;
@@ -51,6 +52,21 @@ struct mali_cache_flush {
    enum mali_cs_flush_mode l2;
    enum mali_cs_flush_mode lsc;
    enum mali_cs_other_flush_mode others;
+};
+
+struct mali_preload_range {
+   uint64_t start, end;
+};
+
+/* Fragment writes since the last emitted drain of every iterator. Until
+ * that drain, earlier command buffers may have left work in flight. */
+struct mali_preload_tracking {
+   struct mali_preload_range ranges[16];
+   unsigned count;
+   bool valid;
+   bool unknown;
+   bool pending; /* a diagnostic LOAD invalidate is pending on F */
+   struct mali_preload_stats stats;
 };
 
 struct mali_cmd_cs {
@@ -142,6 +158,7 @@ struct mali_cmd_buffer {
       struct mali_gfx_draw_state draw;
       /* The render pass instance being recorded (mali_cmd_render.c). */
       struct mali_render_state render;
+      struct mali_preload_tracking preload;
    } gfx;
 
    /* Cached copies of push descriptor sets (outside gfx/compute, which a

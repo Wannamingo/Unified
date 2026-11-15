@@ -52,6 +52,15 @@
 
 struct mali_shader;
 
+struct mali_preload_stats {
+   uint64_t candidates;
+   uint64_t skipped;
+   uint64_t covered;
+   uint64_t unknown;
+   uint64_t overlap;
+   uint64_t full_waits;
+};
+
 struct mali_csf_device {
    struct mali_device *dev;
    struct mali_kbase *kb;
@@ -61,6 +70,8 @@ struct mali_csf_device {
     * scoreboard entry (mali_cs.h) instead of the vertex/tiler barrier
     * counter: gpu_features bit 3, as the blob decides. */
    bool shared_sb;
+   bool preload_track;
+   bool preload_stats;
 
    /* The event thread: reads the kbase event channel, wakes waiters,
     * turns a queue-group error into device loss. */
@@ -115,6 +126,7 @@ struct mali_csf_queue {
 
    /* Submits handed to the rings so far; submit N writes N into done[]. */
    uint64_t seqno;
+   struct mali_preload_stats preload;
    /* The last submit number each subqueue will write into its done slot;
     * a subqueue that had no work since keeps its old value. */
    uint64_t last_signal[MALI_SUBQUEUE_COUNT];

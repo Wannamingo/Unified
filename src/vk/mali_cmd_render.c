@@ -42,6 +42,7 @@
 
 #include "mali_arch.h"
 #include "mali_image.h"
+#include "mali_memory.h"
 #include "mali_queue.h"
 
 #if PAN_ARCH != 11
@@ -50,6 +51,105 @@
 
 /* ---------------------------------------------------------------------- */
 /* Begin                                                                   */
+
+/* Adapted from the zenithblue PanVK preload tracker. Use the whole image,
+ * including auxiliary data. Imports can alias through different GPU VAs. */
+static bool
+preload_image_range(const struct mali_image *image, struct mali_preload_range *range)
+{
+   const uint64_t align_mask = MALI_IMAGE_ALIGNMENT - 1;
+   if (!image->mem || image->ahb || image->wsi_mem ||
+       image->vk.external_handle_types || image->mem->dmabuf_fd >= 0 ||
+       image->mem->vk.import_handle_type || image->mem->vk.export_handle_types ||
+       (image->vk.create_flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
+                                  VK_IMAGE_CREATE_DISJOINT_BIT)) ||
+       !image->base || !image->size || image->base > UINT64_MAX - align_mask ||
+       image->size > UINT64_MAX - align_mask - image->base)
+      return false;
+
+   range->start = image->base & ~align_mask;
+   range->end = (image->base + image->size + align_mask) & ~align_mask;
+   return true;
+}
+
+static void
+track_fragment_image(struct mali_preload_tracking *tracking, const struct mali_image *image)
+{
+   if (!image || tracking->unknown)
+      return;
+
+   struct mali_preload_range range;
+   if (!preload_image_range(image, &range)) {
+      tracking->unknown = true;
+      return;
+   }
+
+   for (unsigned i = 0; i < tracking->count; i++) {
+      struct mali_preload_range *prior = &tracking->ranges[i];
+      if (range.start >= prior->start && range.end <= prior->end)
+         return;
+   }
+
+   if (tracking->count == ARRAY_SIZE(tracking->ranges)) {
+      tracking->unknown = true;
+      return;
+   }
+   tracking->ranges[tracking->count++] = range;
+}
+
+static void
+track_fragment_writes(struct mali_cmd_buffer *cmd, const struct mali_render_state *r)
+{
+   struct mali_preload_tracking *tracking = &cmd->gfx.preload;
+   if (!tracking->valid || tracking->unknown)
+      return;
+   if (r->fragment_writes_global) {
+      tracking->unknown = true;
+      return;
+   }
+
+   for (unsigned i = 0; i < r->desc.rt_count; i++) {
+      track_fragment_image(tracking, r->desc.rt[i].image);
+      track_fragment_image(tracking, r->desc.resolve[i].image);
+   }
+   track_fragment_image(tracking, r->desc.z.image);
+   track_fragment_image(tracking, r->desc.s.image);
+   track_fragment_image(tracking, r->desc.resolve_z.image);
+   track_fragment_image(tracking, r->desc.resolve_s.image);
+}
+
+enum preload_result {
+   PRELOAD_SKIP,
+   PRELOAD_UNKNOWN,
+   PRELOAD_OVERLAP,
+};
+
+static enum preload_result
+classify_preloads(const struct mali_cmd_buffer *cmd)
+{
+   const struct mali_preload_tracking *tracking = &cmd->gfx.preload;
+   if (!tracking->valid || tracking->unknown)
+      return PRELOAD_UNKNOWN;
+
+   const struct mali_render_desc *desc = &cmd->gfx.render.desc;
+   const struct mali_fb_target *targets[10] = {&desc->z, &desc->s};
+   for (unsigned i = 0; i < desc->rt_count; i++)
+      targets[i + 2] = &desc->rt[i];
+
+   for (unsigned i = 0; i < desc->rt_count + 2; i++) {
+      if (!targets[i]->preload)
+         continue;
+      struct mali_preload_range range;
+      if (!preload_image_range(targets[i]->image, &range))
+         return PRELOAD_UNKNOWN;
+      for (unsigned j = 0; j < tracking->count; j++) {
+         const struct mali_preload_range *written = &tracking->ranges[j];
+         if (range.start < written->end && written->start < range.end)
+            return PRELOAD_OVERLAP;
+      }
+   }
+   return PRELOAD_SKIP;
+}
 
 void
 MALI_PER_ARCH(cmd_render_begin)(struct mali_cmd_buffer *cmd, const struct mali_render_desc *desc)
@@ -77,6 +177,37 @@ MALI_PER_ARCH(cmd_render_begin)(struct mali_cmd_buffer *cmd, const struct mali_r
       };
       struct mali_cs_deps deps = {0};
       mali_cmd_add_deps(cmd, &dep, &deps);
+      const struct mali_csf_device *csf = cmd->dev->csf;
+      const unsigned f = MALI_SUBQUEUE_FRAGMENT;
+      if (csf->preload_track || csf->preload_stats) {
+         struct mali_preload_tracking *tracking = &cmd->gfx.preload;
+         const unsigned all = csf->sb.all_iters_mask;
+         const bool covered = (cmd->cs[f].pending_wait & all) == all;
+         if (csf->preload_stats) {
+            tracking->stats.candidates++;
+            tracking->pending = true;
+            tracking->stats.covered += covered;
+         }
+         if (csf->preload_track && !covered) {
+            switch (classify_preloads(cmd)) {
+            case PRELOAD_SKIP:
+               /* Keep cache maintenance and any existing dependencies. */
+               deps.src[f].wait_sb_mask &= ~all;
+               deps.dst[f].wait_subqueue_mask &= ~BITFIELD_BIT(f);
+               if (csf->preload_stats)
+                  tracking->stats.skipped++;
+               break;
+            case PRELOAD_UNKNOWN:
+               if (csf->preload_stats)
+                  tracking->stats.unknown++;
+               break;
+            case PRELOAD_OVERLAP:
+               if (csf->preload_stats)
+                  tracking->stats.overlap++;
+               break;
+            }
+         }
+      }
       mali_cmd_emit_barrier(cmd, &deps);
    }
 }
@@ -380,6 +511,8 @@ issue_fragment_jobs(struct mali_cmd_buffer *cmd, struct mali_render_state *r,
       cs_sync64_wait(b, false, MALI_CS_CONDITION_GREATER, ref, addr);
    }
    mali_cmd_frag_flush_pending(cmd);
+   if (csf->preload_track)
+      track_fragment_writes(cmd, r);
    /* The fragment job reads the patched FBD from memory. */
    if (r->crc_rt >= 0)
       cs_flush_stores(b);

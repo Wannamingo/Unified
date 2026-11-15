@@ -125,6 +125,7 @@ enum mali_measure_kind {
    MALI_MEASURE_PASS_FRAG,   /* a render pass, fragment subqueue */
    MALI_MEASURE_DISPATCH,    /* RUN_COMPUTE, internal copies included */
    MALI_MEASURE_DRAW,        /* RUN_IDVS */
+   MALI_MEASURE_PRELOAD_SYNC,/* a pending LOAD cache flush, with or without a drain */
    MALI_MEASURE_KIND_COUNT,
 };
 

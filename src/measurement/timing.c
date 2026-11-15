@@ -153,13 +153,15 @@ mali_measure_cmd_destroy(struct mali_cmd_buffer *cmd)
  * device (end up to 7 us before begin).
  */
 static void
-emit_timestamp(struct mali_cmd_buffer *cmd, enum mali_subqueue sq, uint64_t va, bool end)
+emit_timestamp(struct mali_cmd_buffer *cmd, enum mali_subqueue sq, uint64_t va,
+               bool end, bool immediate)
 {
    const struct mali_csf_device *csf = cmd->dev->csf;
    struct cs_builder *b = mali_cmd_cs(cmd, sq);
    struct cs_index addr = mali_cs_scratch_reg64(b, MALI_CS_SCRATCH_MEASURE);
 
    const struct cs_async_op op =
+      immediate ? cs_now() :
       end ? cs_defer(csf->sb.all_iters_mask | MALI_SB_MASK(MALI_SB_DEFERRED_FLUSH),
                      MALI_SB_DEFERRED_SYNC)
           : cs_defer(csf->sb.all_iters_mask, MALI_SB_DEFERRED_FLUSH);
@@ -206,7 +208,9 @@ mali_measure_begin(struct mali_cmd_buffer *cmd, enum mali_measure_kind kind,
    mc->slots_left--;
 
    util_dynarray_append_typed(&mc->regions, struct mali_measure_region, r);
-   emit_timestamp(cmd, sq, r.slot_va, false);
+   /* Bracket the actual wait and flush. The usual deferred start would
+    * take its timestamp after the drain we want to measure. */
+   emit_timestamp(cmd, sq, r.slot_va, false, kind == MALI_MEASURE_PRELOAD_SYNC);
    return util_dynarray_num_elements(&mc->regions, struct mali_measure_region);
 }
 
@@ -225,7 +229,8 @@ mali_measure_end(struct mali_cmd_buffer *cmd, uint32_t handle)
 {
    struct mali_measure_region *r = region(cmd, handle);
    if (r)
-      emit_timestamp(cmd, r->sq, r->slot_va + 8, true);
+      emit_timestamp(cmd, r->sq, r->slot_va + 8, true,
+                     r->kind == MALI_MEASURE_PRELOAD_SYNC);
 }
 
 void

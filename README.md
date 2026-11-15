@@ -2,7 +2,9 @@
 
 Unified is a Vulkan driver for Arm Mali GPUs on the stock Arm `kbase` kernel driver. On Android, it is loaded by an application that supports custom GPU driver packages, such as HakuX-Mali.
 
-[Download Unified 0.4.53](https://github.com/Wannamingo/Unified/releases/tag/v0.4.53)
+[Download Unified 0.4.57](https://github.com/Wannamingo/Unified/releases/tag/v0.4.57)
+
+Unified 0.4.57 fixes black floor tiles in Sacred 2 Remaster on RG477M. The driver now reports `VK_EXT_4444_formats` and the two packed-format features on Mali architecture v11 when both formats support sampling, linear filtering and use as a blit source. Eden uses these feature flags to select the texture channel order.
 
 | Device | GPU | GPU validation |
 | --- | --- | --- |
@@ -18,21 +20,22 @@ Unified 0.4.53 enables `VK_KHR_vertex_attribute_divisor` on the verified GPUs, i
 
 1. Download the driver ZIP from the release page. Keep the archive intact.
 2. In a compatible app, open its GPU-driver settings and import the ZIP. In HakuX-Mali, use **Settings → GPU driver → Add a driver**.
-3. Select **Unified 0.4.53** and restart the game. To return to the device driver, select **System** and restart the game again.
+3. Select **Unified 0.4.57** and restart the game. To return to the device driver, select **System** and restart the game again.
 
-Скачайте ZIP из Releases. В HakuX-Mali откройте **Настройки → Драйвер GPU → Добавить драйвер**, выберите ZIP, затем **Unified 0.4.53** и перезапустите игру. Для возврата выберите **Системный драйвер** и снова перезапустите игру. Версия HakuX-Mali 1.7.8 распознаёт Unified. Проверенная 1.7.1 на RG Rotate отклоняла драйвер с именем Unified.
+Скачайте ZIP из Releases. В HakuX-Mali откройте **Настройки → Драйвер GPU → Добавить драйвер**, выберите ZIP, затем **Unified 0.4.57** и перезапустите игру. Для возврата выберите **Системный драйвер** и снова перезапустите игру. Версия HakuX-Mali 1.7.8 распознаёт Unified. Проверенная 1.7.1 на RG Rotate отклоняла драйвер с именем Unified.
 
 ## Build from source
 
-Use Mesa at the revision pinned in `meson.build`. The public build uses only the pinned Mesa sources and its license notices, while `mesa-glue/` defines what to compile.
+Use Mesa at the revision pinned in `meson.build` and apply the accompanying format patch. `mesa-glue/` defines what to compile.
 
 ```sh
 git clone https://github.com/Wannamingo/Unified.git
 cd Unified
-git checkout v0.4.53
+git checkout v0.4.57
 git init mesa
-git -C mesa fetch --depth 1 https://github.com/bmdhacks/armsx2-turnip.git f59c211100b174191d9df540451e94b2d5cb2b26
+git -C mesa fetch --depth 1 https://github.com/bmdhacks/armsx2-turnip.git 45ff8fac44d9132118d0dddd2ff49f5d827533fb
 git -C mesa checkout --detach FETCH_HEAD
+git -C mesa apply ../patches/mesa-0.4.57.patch
 ```
 
 The build needs Meson 1.7+, Ninja, Python with Mako and PyYAML, a native C/C++ toolchain, Rust with the `aarch64-linux-android` target, and bindgen with libclang. The published Android build used NDK `29.0.14206865`, API 31 and `-Dmeasurement=true`. For a Linux-hosted cross build, copy `cross/android-aarch64.ini` and set `ndk` and `api = '31'` in the copy before configuring Meson.
@@ -42,7 +45,7 @@ meson setup build-android --cross-file cross/android-local.ini --buildtype=relea
 meson compile -C build-android
 ```
 
-The build produces `build-android/src/libvulkan_unified.so`. The Android ZIP carries the tested binary under the loader-compatible name `libvulkan_malisx2.so`.
+The build produces `build-android/src/libvulkan_unified.so`. In the Android ZIP, `meta.json` identifies the driver library to load.
 
 ## Credits and licensing
 

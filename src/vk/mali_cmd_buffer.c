@@ -705,7 +705,27 @@ mali_cmd_frag_flush_pending(struct mali_cmd_buffer *cmd)
    if (!cs->pending_wait && flush_is_nop(&cs->pending_flush) && !cs->pending_signal)
       return;
    struct cs_builder *b = &cs->b;
+   struct mali_preload_tracking *tracking = &cmd->gfx.preload;
+   const struct mali_csf_device *csf = cmd->dev->csf;
+   const bool drains = (cs->pending_wait & csf->sb.all_iters_mask) == csf->sb.all_iters_mask;
+   uint32_t timing = 0;
+   if (unlikely(tracking->pending && cmd->measure)) {
+      timing = mali_measure_begin(cmd, MALI_MEASURE_PRELOAD_SYNC, MALI_SUBQUEUE_FRAGMENT,
+                                  cmd->passes - 1);
+      mali_measure_info(cmd, timing, drains, cs->pending_wait, 0, 0);
+   }
    emit_wait_and_flush(b, cs->pending_wait, &cs->pending_flush);
+   if (unlikely(timing))
+      mali_measure_end(cmd, timing);
+   if (tracking->pending) {
+      tracking->stats.full_waits += drains;
+      tracking->pending = false;
+   }
+   if (csf->preload_track && drains) {
+      tracking->valid = true;
+      tracking->unknown = false;
+      tracking->count = 0;
+   }
    if (cs->pending_signal) {
       /* The barrier signal other subqueues wait for; its number was taken
        * when the barrier was recorded (mali_cmd_emit_barrier). */

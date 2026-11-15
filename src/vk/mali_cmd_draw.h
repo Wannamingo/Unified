@@ -288,6 +288,9 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
    if (!mali_gfx_update_dirty(cmd, di, &dbk))
       return false;
 
+   if (cmd->dev->csf->preload_track && p->fs && p->fs->info.writes_global)
+      r->fragment_writes_global = true;
+
    if (d->dirty & MALI_GFX_DIRTY_BLEND) {
       if (!mali_gfx_build_blend(cmd, &v))
          return false;

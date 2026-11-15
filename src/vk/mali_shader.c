@@ -1234,13 +1234,96 @@ lower_robust_texel_fetch(nir_builder *b, nir_tex_instr *tex, UNUSED void *data)
    return true;
 }
 
+/*
+ * Reject a shader whose resource bindings do not exist in its pipeline
+ * layout before lowering forms hardware descriptor indices. A stale
+ * application shader cache can pair the wrong shader and layout.
+ */
+struct layout_check {
+   const struct vk_pipeline_layout *layout;
+   bool bad;
+   uint32_t set, binding;
+};
+
+static void
+layout_check_binding(struct layout_check *c, uint32_t set, uint32_t binding)
+{
+   if (c->bad)
+      return;
+
+   const struct vk_pipeline_layout *layout = c->layout;
+   if (layout && set < layout->set_count && set < MALI_MAX_SETS &&
+       layout->set_layouts[set]) {
+      const struct mali_descriptor_set_layout *set_layout =
+         mali_descriptor_set_layout(layout->set_layouts[set]);
+      if (binding < set_layout->binding_count && set_layout->bindings[binding].desc_count)
+         return;
+   }
+
+   c->bad = true;
+   c->set = set;
+   c->binding = binding;
+}
+
+static void
+layout_check_deref(struct layout_check *c, nir_src *src)
+{
+   const nir_variable *var = nir_deref_instr_get_variable(nir_src_as_deref(*src));
+   layout_check_binding(c, var->data.descriptor_set, var->data.binding);
+}
+
+static bool
+layout_check_instr(nir_builder *b, nir_instr *instr, void *data)
+{
+   struct layout_check *c = data;
+
+   if (instr->type == nir_instr_type_tex) {
+      nir_tex_instr *tex = nir_instr_as_tex(instr);
+      const nir_tex_src_type srcs[2] = {nir_tex_src_sampler_deref, nir_tex_src_texture_deref};
+      for (unsigned i = 0; i < 2; i++) {
+         const int idx = nir_tex_instr_src_index(tex, srcs[i]);
+         if (idx >= 0)
+            layout_check_deref(c, &tex->src[idx].src);
+      }
+      return false;
+   }
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+   switch (intr->intrinsic) {
+   case nir_intrinsic_vulkan_resource_index:
+      layout_check_binding(c, nir_intrinsic_desc_set(intr), nir_intrinsic_binding(intr));
+      break;
+   case nir_intrinsic_image_deref_store:
+   case nir_intrinsic_image_deref_load:
+   case nir_intrinsic_image_deref_atomic:
+   case nir_intrinsic_image_deref_atomic_swap:
+   case nir_intrinsic_image_deref_size:
+   case nir_intrinsic_image_deref_samples:
+      layout_check_deref(c, &intr->src[0]);
+      break;
+   default:
+      break;
+   }
+   return false;
+}
+
 /* Resource lowering (panvk_lower_nir). On v7, a table map that cannot be
  * allocated sets s->v7.failed and ends the lowering early. */
 static VkResult
-lower_nir(nir_shader *nir, const struct mali_shader_compile_info *info,
+lower_nir(struct mali_device *dev, nir_shader *nir, const struct mali_shader_compile_info *info,
           struct mali_shader *s, bool allow_merging_workgroups)
 {
    const struct vk_pipeline_robustness_state *rs = info->rs;
+
+   struct layout_check check = {.layout = info->layout};
+   NIR_PASS(_, nir, nir_shader_instructions_pass, layout_check_instr,
+            nir_metadata_all, &check);
+   if (check.bad)
+      return vk_errorf(dev, VK_ERROR_INVALID_SHADER_NV,
+                       "the %s shader names set %u binding %u, which the pipeline layout does not have",
+                       mesa_shader_stage_name(nir->info.stage), check.set, check.binding);
 
    NIR_PASS(_, nir, nir_opt_large_constants, NULL, 32);
 
@@ -2393,7 +2476,7 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
    switch (stage) {
    case MESA_SHADER_VERTEX:
       s->desc.driver_table_prefix = MALI_MAX_VS_ATTRIBS;
-      result = lower_nir(nir, info, s, false);
+      result = lower_nir(dev, nir, info, s, false);
       if (result != VK_SUCCESS) {
          result = vk_errorf(dev, result, "descriptor lowering failed for %s shader: incompatible layout or allocation failure",
                             mesa_shader_stage_name(stage));
@@ -2463,7 +2546,7 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
       s->desc.driver_table_prefix = nir->num_inputs;
       inputs.varying_layout = info->vs_varying_layout;
 
-      result = lower_nir(nir, info, s, false);
+      result = lower_nir(dev, nir, info, s, false);
       if (result != VK_SUCCESS) {
          result = vk_errorf(dev, result, "descriptor lowering failed for %s shader: incompatible layout or allocation failure",
                             mesa_shader_stage_name(stage));
@@ -2530,7 +2613,7 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
        * panvk gates this on PAN_ARCH >= 9. allow_merging_workgroups stays
        * false. */
 #endif
-      result = lower_nir(nir, info, s, s->info.cs.allow_merging_workgroups);
+      result = lower_nir(dev, nir, info, s, s->info.cs.allow_merging_workgroups);
       if (result != VK_SUCCESS) {
          result = vk_errorf(dev, result, "descriptor lowering failed for %s shader: incompatible layout or allocation failure",
                             mesa_shader_stage_name(stage));
