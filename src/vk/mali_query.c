@@ -161,11 +161,8 @@ MALI_PER_ARCH(DestroyQueryPool)(VkDevice _device, VkQueryPool _pool,
    vk_query_pool_destroy(&dev->vk, pAllocator, &pool->vk);
 }
 
-/* Host reset changes availability only. Vulkan requires all GPU commands
- * using this range to have completed and external host synchronization.
- * Query pool availability is CPU-uncached coherent-local memory; submit
- * already cleans/invalidates GPU L2. Leave values, padding and CSF sync
- * error words intact; a new timestamp/BeginQuery produces the next value. */
+/* Vulkan requires completed GPU use and external host synchronization for
+ * this range. Query memory is CPU-uncached coherent-local memory. */
 VKAPI_ATTR void VKAPI_CALL
 MALI_PER_ARCH(ResetQueryPool)(VkDevice _device, VkQueryPool _pool,
                               uint32_t firstQuery, uint32_t queryCount)
@@ -173,9 +170,19 @@ MALI_PER_ARCH(ResetQueryPool)(VkDevice _device, VkQueryPool _pool,
    VK_FROM_HANDLE(mali_query_pool, pool, _pool);
    assert(firstQuery < pool->vk.query_count);
    assert(queryCount <= pool->vk.query_count - firstQuery);
-   for (uint32_t i = 0; i < queryCount; i++)
-      __atomic_store_n(mali_query_avail_cpu(pool, firstQuery + i), 0,
-                       __ATOMIC_RELAXED);
+   for (uint32_t i = 0; i < queryCount; i++) {
+      const uint32_t query = firstQuery + i;
+      __atomic_store_n(mali_query_avail_cpu(pool, query), 0, __ATOMIC_RELAXED);
+#if PAN_ARCH == 7
+      if (pool->vk.query_type == VK_QUERY_TYPE_OCCLUSION) {
+         /* Bifrost accumulates into per-core counters. Both reset paths
+          * initialise them so BeginQuery need not emit separate jobs. */
+         uint64_t *values = (uint64_t *)(pool->val_cpu + (uint64_t)query * pool->val_stride);
+         for (uint32_t core = 0; core < pool->val_count; core++)
+            __atomic_store_n(&values[core], 0, __ATOMIC_RELAXED);
+      }
+#endif
+   }
    __atomic_thread_fence(__ATOMIC_RELEASE);
 }
 

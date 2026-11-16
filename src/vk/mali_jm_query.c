@@ -161,10 +161,10 @@ MALI_PER_ARCH(CmdWriteTimestamp)(VkCommandBuffer commandBuffer, VkPipelineStageF
  * hardware adds into the entry of the shader core that shaded the tile, so
  * a query has one counter per core ID and its result is their sum.
  *
- *  - Begin: Write Value jobs zero the counters (one job each), in the open
- *    batch's vtc chain. The batch's fragment atom starts after its vtc
- *    atom, so the counters are zero before any fragment job can add to
- *    them. The draws that follow carry the counters (MALI_GFX_DIRTY_OQ).
+ *  - Begin: the draws that follow carry the counters (MALI_GFX_DIRTY_OQ).
+ *    On v7, either query reset already zeroed all per-core counters. On
+ *    v9, Begin also zeroes the counter via the open batch's VTC chain,
+ *    which completes before the fragment atom that adds to the counter.
  *  - End: the draws stop carrying them, and the availability word is set by
  *    a Write Value job with the Barrier bit on the fragment chain, behind
  *    the fragment jobs recorded so far: the barrier makes it start when
@@ -207,9 +207,9 @@ MALI_PER_ARCH(CmdBeginQuery)(VkCommandBuffer commandBuffer, VkQueryPool _pool, u
    if (pool->vk.query_type != VK_QUERY_TYPE_OCCLUSION)
       return;
 
-   /* The pass's vtc chain once it tiles (the batch may not close inside
-    * it), else the open batch's. */
    const uint64_t counter = mali_query_val_va(pool, query);
+#if PAN_ARCH != 7
+   /* The pass's VTC chain once it tiles, else the open batch's. */
    struct mali_jm_chain *c = cmd->gfx.render.active && cmd->gfx.render.tiler
                                 ? mali_jm_cmd_pass_vtc(cmd)
                                 : mali_jm_cmd_vtc_value(cmd);
@@ -217,8 +217,7 @@ MALI_PER_ARCH(CmdBeginQuery)(VkCommandBuffer commandBuffer, VkQueryPool _pool, u
       return;
    /* No Barrier bit: nothing in the chain reads or writes the counter, and
     * a barrier here would hold the pass's tiling back until every draw
-    * before it was done. One job per counter (one on v9, one per shader
-    * core ID on v7). */
+    * before it was done. */
    /* One aggregate counter in the first slot is permitted. Remaining
     * multiview slots hold zero but must also become available at End. */
    for (uint32_t i = 0; i < render_query_count(cmd); i++) {
@@ -229,6 +228,7 @@ MALI_PER_ARCH(CmdBeginQuery)(VkCommandBuffer commandBuffer, VkQueryPool _pool, u
             return;
       }
    }
+#endif
 
    d->oq_addr = counter;
    d->oq_precise = flags & VK_QUERY_CONTROL_PRECISE_BIT;

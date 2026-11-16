@@ -509,6 +509,16 @@ emit_viewport(struct mali_cmd_buffer *cmd)
    return p.gpu;
 }
 
+/* A zero-area Vulkan scissor is empty. Encoding it as an inclusive v7
+ * viewport min=max instead produces one pixel. Keep the Vertex job for
+ * shader side effects, but do not emit a Tiler job for such a draw. */
+static bool
+draw_needs_tiler(const struct vk_dynamic_graphics_state *st, const VkRect2D *scissor)
+{
+   return !st->rs.rasterizer_discard_enable &&
+          scissor->extent.width != 0 && scissor->extent.height != 0;
+}
+
 /* ---------------------------------------------------------------------- */
 /* Per-draw descriptors                                                    */
 
@@ -1412,9 +1422,8 @@ draw_one_view(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
       return;
    }
 
-   /* Rasterizer discard: the Vertex job alone, as in panvk, which keeps
-    * the Tiler job only for an occlusion query. */
-   const bool tiling = !st->rs.rasterizer_discard_enable;
+   /* Empty scissor and rasterizer discard still execute the vertex shader. */
+   const bool tiling = draw_needs_tiler(st, &cmd->vk.dynamic_graphics_state.vp.scissors[0]);
 
    /* The Invocation of both jobs (panvk_cmd_draw): (1, vertex range,
     * instances) workgroups of one invocation, with the graphics quirks. */
@@ -1687,7 +1696,7 @@ draw_indirect(struct mali_cmd_buffer *cmd, const struct idraw_call *call, uint32
    if (!arena)
       return;
 
-   const bool tiling = !st->rs.rasterizer_discard_enable;
+   const bool tiling = draw_needs_tiler(st, &cmd->vk.dynamic_graphics_state.vp.scissors[0]);
    struct mali_invocation_packed invocation;
    const uint32_t one[3] = {1, 1, 1};
    mali_v7_pack_invocation(&invocation, one, one, true);

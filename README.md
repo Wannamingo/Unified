@@ -8,6 +8,8 @@ Unified 0.4.63 reduces descriptor-pool memory usage. Small CSF pools share GPU m
 
 Mali-G615 exposes experimental geometry and tessellation. Tests on RG477M covered isolines, indirect tessellated draws, and a tessellation evaluation shader feeding a geometry shader. Mali-G57 and Mali-G52 do not expose these shader stages in this build.
 
+On Mali-G52, an empty scissor suppresses rasterization and still runs the vertex shader. Occlusion counters are cleared by query reset, and BeginQuery reuses the reset counters.
+
 For native G615 testing, set `UNIFIED_TILER_IR=1` to use incremental rendering. The separate `UNIFIED_YUV=1` and `UNIFIED_HOST_IMAGE_COPY=1` options retain the scope of 0.4.60. All three options are disabled by default.
 
 ## Install / Установка
