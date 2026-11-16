@@ -211,6 +211,7 @@ device_destroy(struct mali_device *dev, const VkAllocationCallbacks *alloc)
    if (dev->kbase) {
       mali_event_pool_finish(dev);
       mali_bo_pool_finish(&dev->desc_pool);
+      mali_bo_pool_finish(&dev->descriptor_pages);
       mali_bo_pool_finish(&dev->exec_pool);
    }
    mali_kbase_destroy(dev->kbase);
@@ -402,6 +403,10 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
     * identical shaders through the device's own in-memory cache. */
    mali_bo_pool_init_exec(&dev->exec_pool, dev->kbase);
    mali_bo_pool_init_desc(&dev->desc_pool, dev->kbase);
+   mali_bo_pool_init(&dev->descriptor_pages, dev->kbase, "descriptor pool pages",
+                     mali_kbase_mem_same_va_policy(KB_MEM_PROT_CPU_RD |
+                                                 KB_MEM_PROT_CPU_WR | KB_MEM_PROT_GPU_RD),
+                     MALI_KBASE_MEM_CLASS_DESCRIPTOR_POOL, 256 * 1024, 4096, false);
    mali_event_pool_init(dev);
    mali_device_keys_init(dev);
    /* Frontend-neutral device state: every path below this point that can

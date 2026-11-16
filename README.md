@@ -2,24 +2,21 @@
 
 Unified is a Vulkan driver for Arm Mali GPUs on the stock Arm `kbase` kernel driver. On Android, it is loaded by an application that supports custom GPU driver packages, such as HakuX-Mali.
 
-[Download Unified 0.4.61](https://github.com/Wannamingo/Unified/releases/tag/v0.4.61)
+[Download Unified 0.4.63](https://github.com/Wannamingo/Unified/releases/tag/v0.4.63)
 
-Unified 0.4.61 carries forward the 0.4.60 compatibility work and adds opt-in CSF incremental rendering for tiler heap exhaustion on Mali-G615. The Android ARM64 package targets API 31 or later and reports Vulkan 1.1. The tiler recovery, YUV and host image copy experiments are disabled by default.
+Unified 0.4.63 reduces descriptor-pool memory usage. Small CSF pools share GPU memory blocks, and dynamic descriptors use storage sized for the pool. The Android ARM64 package targets API 31 or later and reports Vulkan 1.1.
 
-| Device | Targeted verification |
-| --- | --- |
-| Anbernic RG477M (Mali-G615) | Actual tiler-heap exhaustion, exact occlusion and pixels after recovery, and non-indexed geometry-shader draws with primitive restart enabled |
-| Anbernic RG Rotate (Mali-G52) | HakuX compatibility and Vulkan query pool reset |
+Mali-G615 exposes experimental geometry and tessellation. Tests on RG477M covered isolines, indirect tessellated draws, and a tessellation evaluation shader feeding a geometry shader. Mali-G57 and Mali-G52 do not expose these shader stages in this build.
 
-For native G615 testing, set `UNIFIED_TILER_IR=1` to use incremental rendering. The separate `UNIFIED_YUV=1` and `UNIFIED_HOST_IMAGE_COPY=1` options retain the scope of 0.4.60. The experimental geometry path covers direct draws. Tessellation and geometry draws using indirect input or indexed primitive restart remain under development.
+For native G615 testing, set `UNIFIED_TILER_IR=1` to use incremental rendering. The separate `UNIFIED_YUV=1` and `UNIFIED_HOST_IMAGE_COPY=1` options retain the scope of 0.4.60. All three options are disabled by default.
 
 ## Install / Установка
 
 1. Download the driver ZIP from the release page. Keep the archive intact.
 2. In a compatible app, open its GPU-driver settings and import the ZIP. In HakuX-Mali, use **Settings → GPU driver → Add a driver**.
-3. Select **Unified 0.4.61** and restart the game. To return to the device driver, select **System** and restart the game again.
+3. Select **Unified 0.4.63** and restart the game. To return to the device driver, select **System** and restart the game again.
 
-Скачайте ZIP из Releases. В HakuX-Mali откройте **Настройки → Драйвер GPU → Добавить драйвер**, выберите ZIP, затем **Unified 0.4.61** и перезапустите игру. Для возврата выберите **Системный драйвер** и снова перезапустите игру. Версия HakuX-Mali 1.7.8 распознаёт Unified. Проверенная 1.7.1 на RG Rotate отклоняла драйвер с именем Unified.
+Скачайте ZIP из Releases. В HakuX-Mali откройте **Настройки → Драйвер GPU → Добавить драйвер**, выберите ZIP, затем **Unified 0.4.63** и перезапустите игру. Для возврата выберите **Системный драйвер** и снова перезапустите игру. Версия HakuX-Mali 1.7.8 распознаёт Unified. Проверенная 1.7.1 на RG Rotate отклоняла драйвер с именем Unified.
 
 ## Build from source
 
@@ -28,17 +25,17 @@ Use Mesa at the revision pinned in `meson.build` and apply the accompanying Mesa
 ```sh
 git clone https://github.com/Wannamingo/Unified.git
 cd Unified
-git checkout v0.4.61
+git checkout v0.4.63
 git init mesa
 git -C mesa fetch --depth 1 https://github.com/bmdhacks/armsx2-turnip.git 45ff8fac44d9132118d0dddd2ff49f5d827533fb
 git -C mesa checkout --detach FETCH_HEAD
-git -C mesa apply ../patches/mesa-0.4.61.patch
+git -C mesa apply ../patches/mesa-0.4.63.patch
 ```
 
-The build needs Meson 1.7+, Ninja, Python with Mako and PyYAML, a native C/C++ toolchain, Rust with the `aarch64-linux-android` target, and bindgen with libclang. The published Android build used NDK `29.0.14206865`, API 31, `-Dmeasurement=true` and `-Dunified_geometry_lab=true`. For a Linux-hosted cross build, copy `cross/android-aarch64.ini` and set `ndk` and `api = '31'` in the copy before configuring Meson.
+The build needs Meson 1.7+, Ninja, Python with Mako and PyYAML, a native C/C++ toolchain, Rust with the `aarch64-linux-android` target, and bindgen with libclang. The published Android build used NDK `29.0.14206865`, API 31, `-Dmeasurement=true`, `-Dunified_geometry_lab=true` and `-Dunified_tessellation_lab=true`. For a Linux-hosted cross build, copy `cross/android-aarch64.ini` and set `ndk` and `api = '31'` in the copy before configuring Meson.
 
 ```sh
-meson setup build-android --cross-file cross/android-local.ini --buildtype=release -Db_ndebug=true -Dmeasurement=true -Dunified_api12_lab=false -Dunified_geometry_lab=true
+meson setup build-android --cross-file cross/android-local.ini --buildtype=release -Db_ndebug=true -Dmeasurement=true -Dunified_api12_lab=false -Dunified_geometry_lab=true -Dunified_tessellation_lab=true
 meson compile -C build-android
 ```
 

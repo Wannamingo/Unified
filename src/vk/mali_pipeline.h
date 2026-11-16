@@ -189,6 +189,17 @@ struct mali_gfx_bind {
    struct vk_input_attachment_location_state ial;
 } __attribute__((aligned(64)));
 
+struct mali_tess_pipeline {
+   struct mali_shader *vertex, *control, *count, *prefix, *generate;
+   struct mali_shader *indirect, *eval, *gs_setup;
+   uint64_t vertex_outputs, control_outputs, eval_outputs;
+   uint32_t input_points, output_points, patch_constants, stride_el, scratch_stride;
+   enum tess_primitive_mode domain;
+   enum mesa_prim raster_mode;
+   uint32_t partitioning;
+   bool point_mode, ccw, lower_left;
+};
+
 struct mali_graphics_pipeline {
    struct mali_pipeline base;
 
@@ -203,6 +214,7 @@ struct mali_graphics_pipeline {
       struct poly_gs_info gs;
       uint64_t vertex_outputs;
    } geometry;
+   struct mali_tess_pipeline tess;
 
    /* Which states are dynamic (MESA_VK_DYNAMIC_*). */
    BITSET_DECLARE(dynamic, MESA_VK_DYNAMIC_GRAPHICS_STATE_ENUM_MAX);
@@ -248,6 +260,7 @@ mali_compute_pipeline(struct vk_pipeline *p)
 /* What mali_gfx_pack_state() packs from. */
 struct mali_gfx_pack_input {
    const struct poly_gs_info *geometry;
+   const struct mali_tess_pipeline *tess;
    const struct vk_dynamic_graphics_state *dyn;
    const struct vk_render_pass_state *rp;
    const struct mali_shader *vs;

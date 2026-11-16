@@ -81,7 +81,7 @@ static void
 dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
          const struct mali_desc_state *desc, const void *push, uint32_t push_size,
          const uint32_t base[3], const uint32_t groups[3], const uint32_t (*textures)[8],
-         unsigned texture_count, uint64_t indirect)
+         unsigned texture_count, uint64_t indirect, uint64_t vertex_srt)
 {
    if (!cs || !cs->spd[MALI_SPD_MAIN])
       return;
@@ -91,7 +91,7 @@ dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
    const struct mali_thread_props tp = mali_thread_props(cmd->dev);
 
    uint64_t fau = mali_compute_fau(cmd, cs, push, push_size, base, groups);
-   uint64_t srt = cs->desc.driver_table_prefix == MALI_MAX_VS_ATTRIBS ?
+   uint64_t srt = vertex_srt ? vertex_srt : cs->desc.driver_table_prefix == MALI_MAX_VS_ATTRIBS ?
       mali_gfx_shader_vs_srt_drv(cmd, cs, NULL) :
       mali_compute_res_table(cmd, cs, desc, textures, texture_count);
    uint64_t tsd = mali_compute_tsd(cmd, cs, &tp, indirect ? NULL : groups);
@@ -189,7 +189,16 @@ MALI_PER_ARCH(cmd_dispatch_shader)(struct mali_cmd_buffer *cmd, const struct mal
                          uint32_t push_size, const uint32_t base[3],
                          const uint32_t groups[3])
 {
-   dispatch(cmd, cs, desc, push, push_size, base, groups, NULL, 0, 0);
+   dispatch(cmd, cs, desc, push, push_size, base, groups, NULL, 0, 0, 0);
+}
+
+void
+mali_v11_cmd_dispatch_poly_indirect(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
+                                    uint64_t grid, uint64_t vertex_srt)
+{
+   const uint32_t base[] = {0, 0, 0}, groups[] = {1, 1, 1};
+   dispatch(cmd, cs, &cmd->gfx.desc, cmd->push_constants, sizeof(cmd->push_constants),
+            base, groups, NULL, 0, grid, vertex_srt);
 }
 
 void
@@ -198,7 +207,7 @@ MALI_PER_ARCH(cmd_dispatch_meta)(struct mali_cmd_buffer *cmd, const struct mali_
                        const uint32_t (*textures)[8], unsigned texture_count)
 {
    const uint32_t base[3] = {0, 0, 0};
-   dispatch(cmd, cs, NULL, push, push_size, base, groups, textures, texture_count, 0);
+   dispatch(cmd, cs, NULL, push, push_size, base, groups, textures, texture_count, 0, 0);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -225,5 +234,5 @@ MALI_PER_ARCH(CmdDispatchIndirect)(VkCommandBuffer commandBuffer, VkBuffer _buff
    const uint32_t groups[3] = {1, 1, 1};
    dispatch(cmd, cmd->compute.shader, &cmd->compute.desc, cmd->push_constants,
             sizeof(cmd->push_constants), base, groups, NULL, 0,
-            vk_buffer_address(buffer, offset));
+            vk_buffer_address(buffer, offset), 0);
 }

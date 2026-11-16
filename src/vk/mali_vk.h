@@ -318,6 +318,7 @@ struct mali_device {
     * descriptors. */
    struct mali_bo_pool exec_pool;
    struct mali_bo_pool desc_pool;
+   struct mali_bo_pool descriptor_pages;
 
    /*
     * Device state every GPU architecture needs, regardless of frontend

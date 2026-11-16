@@ -27,6 +27,10 @@
 
 #define IDVS(reg) MALI_IDVS_SR_##reg
 
+void mali_v11_tess_draw_indirect(struct mali_cmd_buffer *cmd, bool indexed,
+                                uint64_t params, uint32_t stride,
+                                uint64_t count_va, uint32_t max_draws);
+
 /* ---------------------------------------------------------------------- */
 /* FAU                                                                     */
 

@@ -62,6 +62,7 @@
 #include "vk_util.h"
 
 #include "panfrost/compiler/pan_nir.h"
+#include "poly/tessellator.h"
 #include "util/hash_table.h"
 #include "util/os_time.h"
 #include "util/simple_mtx.h"
@@ -71,6 +72,19 @@
 
 /* ---------------------------------------------------------------------- */
 /* Destruction and bind                                                    */
+
+static void
+tess_pipeline_finish(struct mali_device *dev, struct mali_tess_pipeline *tess)
+{
+   MALI_PER_ARCH(shader_unref)(dev, tess->vertex);
+   MALI_PER_ARCH(shader_unref)(dev, tess->control);
+   MALI_PER_ARCH(shader_unref)(dev, tess->count);
+   MALI_PER_ARCH(shader_unref)(dev, tess->prefix);
+   MALI_PER_ARCH(shader_unref)(dev, tess->generate);
+   MALI_PER_ARCH(shader_unref)(dev, tess->indirect);
+   MALI_PER_ARCH(shader_unref)(dev, tess->eval);
+   MALI_PER_ARCH(shader_unref)(dev, tess->gs_setup);
+}
 
 static void
 graphics_pipeline_destroy(struct vk_device *vk_dev, struct vk_pipeline *vk_pipeline,
@@ -84,6 +98,7 @@ graphics_pipeline_destroy(struct vk_device *vk_dev, struct vk_pipeline *vk_pipel
    MALI_PER_ARCH(shader_unref)(dev, p->geometry.main);
    MALI_PER_ARCH(shader_unref)(dev, p->geometry.count);
    MALI_PER_ARCH(shader_unref)(dev, p->geometry.pre);
+   tess_pipeline_finish(dev, &p->tess);
    MALI_PER_ARCH(shader_unref)(dev, p->fs);
    if (p->zsd_mem.size)
       mali_bo_pool_free(&dev->desc_pool, &p->zsd_mem);
@@ -263,7 +278,9 @@ stage_to_nir(struct mali_device *dev, VkPipelineCreateFlags2KHR flags, struct st
                        "the %s stage's SPIR-V was rejected by the SPIR-V front end",
                        mesa_shader_stage_name(stage));
 
-   if (stage != MESA_SHADER_GEOMETRY)
+   /* libpoly must see the original stage IO and TCS's output barriers. */
+   if (stage != MESA_SHADER_GEOMETRY &&
+       stage != MESA_SHADER_TESS_CTRL && stage != MESA_SHADER_TESS_EVAL)
       MALI_PER_ARCH(shader_preprocess)(dev, st->nir);
    return VK_SUCCESS;
 }
@@ -800,6 +817,119 @@ poly_compile(struct mali_device *dev, nir_shader *nir, struct stage *stage,
 }
 
 static VkResult
+poly_compile_stage(struct mali_device *dev, struct stage *stage,
+                   struct vk_pipeline_layout *layout, const struct vk_graphics_pipeline_state *state,
+                   bool inputs, const char *key, struct mali_shader **shader)
+{
+   nir_shader *nir = stage->nir;
+   stage->nir = NULL;
+   return poly_compile(dev, nir, stage, layout, state, inputs, key, shader);
+}
+
+static VkResult
+compile_tess_pipeline(struct mali_device *dev, VkPipelineCreateFlags2KHR flags,
+                      struct vk_pipeline_layout *layout,
+                      const struct vk_graphics_pipeline_state *state, struct stage *vs,
+                      struct stage *tcs, struct stage *tes, bool with_gs,
+                      struct mali_tess_pipeline *tess)
+{
+   if (!state->ts || !state->ts->patch_control_points ||
+       state->ts->patch_control_points > 32 || (state->mv && state->mv->view_mask) ||
+       BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_TS_PATCH_CONTROL_POINTS) ||
+       BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_TS_DOMAIN_ORIGIN) ||
+       BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_IA_PRIMITIVE_TOPOLOGY) ||
+       !state->ia || state->ia->primitive_topology != VK_PRIMITIVE_TOPOLOGY_PATCH_LIST)
+      return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                       "tessellation lab requires a static patch topology and one view");
+
+   struct stage *stages[] = {vs, tcs, tes};
+   for (unsigned i = 0; i < ARRAY_SIZE(stages); ++i) {
+      VkResult result = stage_to_nir(dev, flags, stages[i]);
+      if (result != VK_SUCCESS)
+         return result;
+      nir_shader_gather_info(stages[i]->nir, nir_shader_get_entrypoint(stages[i]->nir));
+   }
+
+   /* Vulkan allows the modes in either stage. The generator reads TES
+    * modes and the TCS lowering also needs the domain and output count. */
+   struct shader_info *eval = &tes->nir->info, *control = &tcs->nir->info;
+   eval->tess.tcs_vertices_out |= control->tess.tcs_vertices_out;
+   eval->tess._primitive_mode |= control->tess._primitive_mode;
+   eval->tess.spacing |= control->tess.spacing;
+   eval->tess.ccw |= control->tess.ccw;
+   eval->tess.point_mode |= control->tess.point_mode;
+   control->tess.tcs_vertices_out = eval->tess.tcs_vertices_out;
+   control->tess._primitive_mode = eval->tess._primitive_mode;
+   if (eval->tess._primitive_mode == TESS_PRIMITIVE_UNSPECIFIED ||
+       !control->tess.tcs_vertices_out || control->tess.tcs_vertices_out > 32)
+      return vk_error(dev, VK_ERROR_INVALID_SHADER_NV);
+
+   *tess = (struct mali_tess_pipeline) {
+      .vertex_outputs = vs->nir->info.outputs_written,
+      .control_outputs = poly_tcs_per_vertex_outputs(tcs->nir),
+      .input_points = state->ts->patch_control_points,
+      .output_points = control->tess.tcs_vertices_out,
+      .patch_constants = util_last_bit(control->patch_outputs_written),
+      .stride_el = poly_tcs_output_stride(tcs->nir) / 4,
+      .domain = eval->tess._primitive_mode,
+      .partitioning = eval->tess.spacing == TESS_SPACING_FRACTIONAL_ODD ?
+         POLY_TESS_PARTITIONING_FRACTIONAL_ODD :
+         eval->tess.spacing == TESS_SPACING_FRACTIONAL_EVEN ?
+         POLY_TESS_PARTITIONING_FRACTIONAL_EVEN : POLY_TESS_PARTITIONING_INTEGER,
+      .point_mode = eval->tess.point_mode,
+      .ccw = eval->tess.ccw,
+      .lower_left = state->ts->domain_origin == VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT,
+   };
+   tess->raster_mode = tess->point_mode ? MESA_PRIM_POINTS :
+      tess->domain == TESS_PRIMITIVE_ISOLINES ? MESA_PRIM_LINES : MESA_PRIM_TRIANGLES;
+   if (!tess->stride_el || !mali_poly_lower_vertex(vs->nir) ||
+       !mali_poly_lower_tcs(tcs->nir) ||
+       !(with_gs ? mali_poly_lower_tes_compute(tes->nir, &tess->eval_outputs) :
+                   mali_poly_lower_tes_raster(tes->nir)))
+      return vk_error(dev, VK_ERROR_INVALID_SHADER_NV);
+
+   VkResult result = poly_compile_stage(dev, vs, layout, NULL, true,
+                                        "poly-tess-vertex-v1", &tess->vertex);
+   if (result == VK_SUCCESS)
+      result = poly_compile_stage(dev, tcs, layout, NULL, false,
+                                  "poly-tess-control-v1", &tess->control);
+   if (result == VK_SUCCESS) {
+      if (with_gs)
+         result = poly_compile_stage(dev, tes, layout, NULL, false,
+                                     "poly-tess-eval-gs-v1", &tess->eval);
+      else
+         result = poly_compile_stage(dev, tes, layout, state, false,
+                                     "poly-tess-raster-v1", &vs->shader);
+   }
+   if (result != VK_SUCCESS)
+      return result;
+
+   const nir_shader_compiler_options *opts =
+      MALI_PER_ARCH(shader_nir_options)(dev, MESA_SHADER_COMPUTE);
+   nir_shader *nir = mali_poly_tess_indirect(opts);
+   result = poly_compile(dev, nir, tcs, layout, NULL, false, "poly-tess-indirect-v1", &tess->indirect);
+   if (result != VK_SUCCESS)
+      return result;
+   nir = mali_poly_tessellator(opts, tess->domain, POLY_TESS_MODE_COUNT,
+                                          &tess->scratch_stride);
+   if (!nir)
+      return vk_error(dev, VK_ERROR_INVALID_SHADER_NV);
+   result = poly_compile(dev, nir, tcs, layout, NULL, false, "poly-tess-count-v1", &tess->count);
+   if (result != VK_SUCCESS)
+      return result;
+   nir = mali_poly_tess_prefix(opts);
+   result = poly_compile(dev, nir, tcs, layout, NULL, false, "poly-tess-prefix-v1", &tess->prefix);
+   if (result != VK_SUCCESS)
+      return result;
+   nir = mali_poly_tessellator(opts, tess->domain, POLY_TESS_MODE_WITH_COUNTS,
+                              &tess->scratch_stride);
+   if (!nir)
+      return vk_error(dev, VK_ERROR_INVALID_SHADER_NV);
+   return poly_compile(dev, nir, tcs, layout, NULL, false,
+                       "poly-tess-generate-v1", &tess->generate);
+}
+
+static VkResult
 create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
                          const VkGraphicsPipelineCreateInfo *ci,
                          const VkAllocationCallbacks *alloc, VkPipeline *out)
@@ -808,8 +938,10 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
    const VkPipelineCreateFlags2KHR flags = vk_graphics_pipeline_create_flags(ci);
    VK_FROM_HANDLE(vk_pipeline_layout, layout, ci->layout);
    struct vk_pipeline_cache *cache = pick_cache(dev, cache_handle);
-   struct stage stages[3];
+   struct stage stages[5];
    struct stage *vs = NULL, *fs = NULL, *gs = NULL;
+   struct stage *tcs = NULL, *tes = NULL;
+   struct mali_tess_pipeline tess = {0};
    struct mali_shader *poly_vertex = NULL, *poly_main = NULL;
    struct mali_shader *poly_count = NULL, *poly_pre = NULL;
    struct poly_gs_info gs_info = {0};
@@ -847,6 +979,17 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
          gs = &stages[stage_count++];
          stage_init(dev, flags, ci->pNext, si, gs);
          break;
+      case VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT:
+      case VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT: {
+         if (PAN_ARCH != 11 || !dev->vk.enabled_features.tessellationShader)
+            return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                             "tessellation shader feature was not enabled");
+         struct stage **stage = si->stage == VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT ?
+                                 &tcs : &tes;
+         *stage = &stages[stage_count++];
+         stage_init(dev, flags, ci->pNext, si, *stage);
+         break;
+      }
       default:
          return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
                           "shader stage 0x%x is not supported", si->stage);
@@ -855,6 +998,9 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
    if (!vs)
       return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
                        "graphics pipeline without a vertex shader");
+   if (!!tcs != !!tes)
+      return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                       "tessellation lab requires paired TCS and TES");
 
    struct vk_graphics_pipeline_all_state all;
    struct vk_graphics_pipeline_state state = {0};
@@ -864,7 +1010,11 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
       return result;
 
    const uint32_t view_mask = state.mv ? state.mv->view_mask : 0;
-   if (!gs) {
+   if (tes) {
+      result = compile_tess_pipeline(dev, flags, layout, &state, vs, tcs, tes, gs != NULL, &tess);
+      if (result != VK_SUCCESS)
+         goto out;
+   } else if (!gs) {
       /* Fragment key does not depend on the pruned vertex output mask.
        * Look it up first: its saved preprocessed mask lets a warm request build
        * the exact same vertex key without translating SPIR-V again. */
@@ -911,25 +1061,31 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
          result = VK_PIPELINE_COMPILE_REQUIRED;
          goto out;
       }
-   } else {
+   }
+   if (gs) {
       if (flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR) {
          result = VK_PIPELINE_COMPILE_REQUIRED;
          goto out;
       }
       /* Keep this path out of the persistent stage cache: the raster VS
        * depends on the whole shader chain, not only the original VS key. */
-      result = stage_to_nir(dev, flags, vs);
-      if (result != VK_SUCCESS) goto out;
+      if (!tes) {
+         result = stage_to_nir(dev, flags, vs);
+         if (result != VK_SUCCESS) goto out;
+         nir_shader_gather_info(vs->nir, nir_shader_get_entrypoint(vs->nir));
+         poly_outputs = vs->nir->info.outputs_written;
+         if (!mali_poly_lower_vertex(vs->nir)) {
+            result = VK_ERROR_INVALID_SHADER_NV;goto out;
+         }
+         result = poly_compile_stage(dev, vs, layout, NULL, true, "poly-sw-vs-v1", &poly_vertex);
+         if (result != VK_SUCCESS) goto out;
+      } else {
+         poly_outputs = tess.eval_outputs;
+      }
       result = stage_to_nir(dev, flags, gs);
       if (result != VK_SUCCESS) goto out;
-      nir_shader_gather_info(vs->nir, nir_shader_get_entrypoint(vs->nir));
-      poly_outputs = vs->nir->info.outputs_written;
-      if (!mali_poly_lower_vertex(vs->nir)) {
-         result = VK_ERROR_INVALID_SHADER_NV;goto out;
-      }
-      nir_shader *sw = vs->nir;vs->nir = NULL;
-      result = poly_compile(dev, sw, vs, layout, NULL, true, "poly-sw-vs-v1", &poly_vertex);
-      if (result != VK_SUCCESS) goto out;
+      if (tes)
+         gs->nir->info.prev_stage = MESA_SHADER_TESS_EVAL;
       struct mali_poly_geometry lower;
       nir_shader *input = gs->nir;gs->nir = NULL;
       if (!mali_poly_lower_geometry(input, &lower)) {
@@ -955,6 +1111,14 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
       POLY_COMPILE(raster, &vs->shader, "poly-gs-raster-v1", &state);
 #undef POLY_COMPILE
       mali_poly_geometry_finish(&lower);
+      if (tes) {
+         const nir_shader_compiler_options *opts =
+            MALI_PER_ARCH(shader_nir_options)(dev, MESA_SHADER_COMPUTE);
+         const unsigned arity = tess.point_mode ? 1 : tess.domain == TESS_PRIMITIVE_ISOLINES ? 2 : 3;
+         nir_shader *setup = mali_poly_tess_gs_setup(opts, &gs_info, arity);
+         result = poly_compile(dev, setup, gs, layout, NULL, false, "poly-tess-gs-setup-v1", &tess.gs_setup);
+         if (result != VK_SUCCESS) goto out;
+      }
    }
    if (!vs->shader) {
       result = stage_compile(dev, cache, flags, vs, layout, &state, NULL);
@@ -962,7 +1126,7 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
          goto out;
    }
    if (fs && !fs->shader) {
-      result = stage_compile(dev, gs ? NULL : cache, flags, fs, layout, &state,
+      result = stage_compile(dev, (gs || tes) ? NULL : cache, flags, fs, layout, &state,
                              &vs->shader->info.varyings.formats);
       if (result != VK_SUCCESS)
          goto out;
@@ -1000,6 +1164,8 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
    p->geometry.gs = gs_info;
    p->geometry.vertex_outputs = poly_outputs;
    poly_vertex = poly_main = poly_count = poly_pre = NULL;
+   p->tess = tess;
+   memset(&tess, 0, sizeof(tess));
    if (layout)
       p->base.layout = vk_pipeline_layout_ref(layout);
    p->vs = vs->shader;
@@ -1027,6 +1193,7 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
    p->baked.uses_dynamic_state = baked_words_use_dynamic_state(state.dynamic);
    const struct mali_gfx_pack_input pack = {
       .geometry = gs ? &p->geometry.gs : NULL,
+      .tess = tes && !gs ? &p->tess : NULL,
       .dyn = &p->state,
       .rp = &p->rp,
       .vs = p->vs,
@@ -1046,6 +1213,7 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
    result = VK_SUCCESS;
 
 out:
+   tess_pipeline_finish(dev, &tess);
    MALI_PER_ARCH(shader_unref)(dev, poly_vertex);
    MALI_PER_ARCH(shader_unref)(dev, poly_main);
    MALI_PER_ARCH(shader_unref)(dev, poly_count);

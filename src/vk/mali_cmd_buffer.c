@@ -543,6 +543,20 @@ collect_deps(struct mali_cmd_buffer *cmd, VkPipelineStageFlags2 src_stages,
    dst_stages = vk_expand_dst_stage_flags2(dst_stages);
    dst_access = vk_filter_dst_access_flags2(dst_stages, dst_access);
 
+   /* The experimental CSF pipeline runs TCS, and TES before a GS, on the
+    * compute subqueue. Application barriers naming those stages must cover
+    * the physical queue, alongside the ordinary V/T and F dependencies. */
+   if (cmd->dev->vk.enabled_features.tessellationShader) {
+      const VkPipelineStageFlags2 poly = VK_PIPELINE_STAGE_2_TESSELLATION_CONTROL_SHADER_BIT |
+         VK_PIPELINE_STAGE_2_TESSELLATION_EVALUATION_SHADER_BIT |
+         VK_PIPELINE_STAGE_2_GEOMETRY_SHADER_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+         VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT;
+      if (src_stages & poly)
+         src_stages |= VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+      if (dst_stages & poly)
+         dst_stages |= VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+   }
+
    /* Constant-offset dynamic FS UBO words are read by the vertex/tiler
     * stream before RUN_IDVS (emit_ubo_push), not by the fragment job.
     * An outside-rendering dependency making FS uniform reads visible

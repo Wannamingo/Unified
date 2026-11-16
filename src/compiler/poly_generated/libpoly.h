@@ -78,6 +78,45 @@ poly_previous_xfb_primitives(nir_builder *b, nir_def *p, nir_def *static_count, 
 void
 poly_pre_gs(nir_builder *b, nir_def *p, nir_def *streams, nir_def *buffers_written, nir_def *buffer_to_stream, nir_def *count_index, nir_def *stride, nir_def *output_end, nir_def *static_count, nir_def *invocations, nir_def *vertices_per_prim, nir_def *gs_invocations, nir_def *gs_primitives, nir_def *c_primitives, nir_def *c_invocations);
 
+nir_def *
+poly_tcs_patch_vertices_in(nir_builder *b, nir_def *p);
+
+nir_def *
+poly_tes_patch_vertices_in(nir_builder *b, nir_def *p);
+
+nir_def *
+poly_tcs_unrolled_id(nir_builder *b, nir_def *p, nir_def *wg_id);
+
+nir_def *
+poly_load_tes_index(nir_builder *b, nir_def *p, nir_def *index);
+
+nir_def *
+poly_tcs_out_address(nir_builder *b, nir_def *p, nir_def *patch_id, nir_def *vtx_id, nir_def *location, nir_def *nr_patch_out, nir_def *out_patch_size, nir_def *vtx_out_mask);
+
+nir_def *
+poly_tes_patch_id(nir_builder *b, nir_def *p, nir_def *raw_id);
+
+nir_def *
+poly_load_tess_coord(nir_builder *b, nir_def *p, nir_def *raw_id);
+
+nir_def *
+poly_tes_in_address(nir_builder *b, nir_def *p, nir_def *raw_id, nir_def *vtx_id, nir_def *location);
+
+nir_def *
+poly_tess_level_outer_default(nir_builder *b, nir_def *p);
+
+nir_def *
+poly_tess_level_inner_default(nir_builder *b, nir_def *p);
+
+void
+mali_poly_tess_triangle(nir_builder *b, nir_def *p, nir_def *patch, nir_def *mode);
+
+void
+mali_poly_tess_quad(nir_builder *b, nir_def *p, nir_def *patch, nir_def *mode);
+
+void
+mali_poly_tess_isoline(nir_builder *b, nir_def *p, nir_def *patch, nir_def *mode);
+
 #ifdef __cplusplus
 } /* extern C */
 #endif

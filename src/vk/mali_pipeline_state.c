@@ -774,8 +774,8 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
    const uint8_t rt_mask = in->rp->attachments & MESA_VK_RP_ATTACHMENT_ANY_COLOR_BITS;
    bool modifies_coverage = false;
 
-   const enum mesa_prim prim = in->geometry ? in->geometry->mode :
-      vk_topology_to_mesa(dyn->ia.primitive_topology);
+   const enum mesa_prim prim = in->tess ? in->tess->raster_mode :
+      in->geometry ? in->geometry->mode : vk_topology_to_mesa(dyn->ia.primitive_topology);
    const enum mesa_prim reduced = u_reduced_prim(prim);
    bool msaa = dyn->ms.rasterization_samples > 1;
    /* Bresenham lines are rasterized at pixel centres. */
@@ -873,7 +873,9 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
          }
 
          cfg.aligned_line_ends = rs->line.mode == VK_LINE_RASTERIZATION_MODE_BRESENHAM;
-         cfg.front_face_ccw = rs->front_face == VK_FRONT_FACE_COUNTER_CLOCKWISE;
+         cfg.front_face_ccw = (rs->front_face == VK_FRONT_FACE_COUNTER_CLOCKWISE) ^
+            (in->tess && mali_poly_tess_winding(prim == MESA_PRIM_TRIANGLES,
+                                                in->tess->ccw, in->tess->lower_left));
          /* Face culling is for polygons only. */
          const bool polygon = reduced == MESA_PRIM_TRIANGLES;
          cfg.cull_front_face = polygon && (rs->cull_mode & VK_CULL_MODE_FRONT_BIT);
@@ -992,8 +994,8 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
          vk_rasterization_state_depth_clip_enable(rs);
       cfg.secondary_shader = vs->info.vs.secondary_enable && fs != NULL;
 #if PAN_ARCH >= 9
-      cfg.primitive_restart = in->geometry ? poly_gs_indexed(in->geometry->shape) :
-         dyn->ia.primitive_restart_enable;
+      cfg.primitive_restart = !in->tess &&
+         (in->geometry ? poly_gs_indexed(in->geometry->shape) : dyn->ia.primitive_restart_enable);
 #else
       /* An enum on v7: the implicit restart index of the index type
        * (panvk_emit_tiler_primitive). */

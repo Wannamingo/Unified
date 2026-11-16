@@ -131,6 +131,10 @@ draw_indirect(struct mali_cmd_buffer *cmd, bool indexed, uint64_t params, uint32
       return;
    if (mali_gfx_discards(cmd))
       return;
+   if (d->pipeline->tess.control) {
+      mali_v11_tess_draw_indirect(cmd, indexed, params, stride, count_va, max_draws);
+      return;
+   }
    if (d->pipeline->geometry.vertex) {
       vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
       return;

@@ -380,6 +380,10 @@ struct mali_gfx_draw_state {
  * shaders without descriptors), TLS/WLS; RUN_COMPUTE on the compute
  * subqueue (CSF) or a Compute job in the open batch's vtc chain (JM).
  */
+void mali_v11_cmd_dispatch_poly_indirect(struct mali_cmd_buffer *cmd,
+                                        const struct mali_shader *cs,
+                                        uint64_t grid, uint64_t vertex_srt);
+
 MALI_PER_ARCH_DECL(void, cmd_dispatch_shader,
                    (struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
                     const struct mali_desc_state *desc, const void *push, uint32_t push_size,

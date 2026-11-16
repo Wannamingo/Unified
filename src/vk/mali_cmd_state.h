@@ -1106,6 +1106,8 @@ struct mali_draw_info {
    int32_t vertex_offset;      /* firstVertex or vertexOffset */
    uint32_t first_instance;
    bool indexed;
+   uint64_t tess_count_va;     /* internal draw parameters emitted by compute */
+   bool tess_indirect_instances;
 };
 
 /* Whether a dirty dynamic state may feed the pipeline bake (gfx_pack_state):
@@ -1255,7 +1257,8 @@ mali_gfx_update_dirty(struct mali_cmd_buffer *cmd, const struct mali_draw_info *
             .vs = p->vs,
             .fs = p->fs,
             .view_mask = p->state.rp.view_mask,
-            .geometry = p->geometry.vertex ? &p->geometry.gs : NULL,
+            .geometry = p->geometry.main ? &p->geometry.gs : NULL,
+            .tess = p->tess.control && !p->geometry.main ? &p->tess : NULL,
          };
          d->dyn_baked.uses_dynamic_state = true;
          MALI_PER_ARCH(gfx_pack_state)(&in, &d->dyn_baked);

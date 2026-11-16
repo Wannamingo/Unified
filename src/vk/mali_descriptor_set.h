@@ -28,6 +28,7 @@
 #define MALI_DESCRIPTOR_SET_H
 
 #include <stdint.h>
+#include "mali_bo_pool.h"
 
 #include "util/bitset.h"
 #include "util/u_math.h"
@@ -63,6 +64,11 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(mali_buffer_view, vk.base, VkBufferView,
 
 struct mali_descriptor_pool;
 
+struct mali_dynamic_buffer {
+   uint64_t addr;
+   uint64_t range;
+};
+
 struct mali_descriptor_set {
    struct vk_object_base base;
    struct mali_descriptor_pool *pool;
@@ -91,10 +97,7 @@ struct mali_descriptor_set {
 
    /* Dynamic uniform/storage buffers, by the index the layout gives them
     * (binding desc_idx + array element). */
-   struct {
-      uint64_t addr;
-      uint64_t range;
-   } dyn_bufs[MALI_MAX_DYNAMIC_BUFFERS];
+   struct mali_dynamic_buffer *dyn_bufs;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(mali_descriptor_set, base, VkDescriptorSet,
@@ -103,9 +106,10 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(mali_descriptor_set, base, VkDescriptorSet,
 struct mali_descriptor_pool {
    struct vk_object_base base;
 
-   /* All set memory: one kbase allocation, sub-allocated by a heap. No
-    * allocation (gpu_va 0) when the pool holds only dynamic buffers. */
+   /* All set memory, sub-allocated by heap. Small CSF pools own a page
+    * in a shared BO. Large pools own their BO directly. */
    struct mali_kbase_bo bo;
+   struct mali_bo_ref page;
    struct util_vma_heap heap;
    uint64_t heap_size;
    /* The sets' host copies (mali_descriptor_set::host), heap_size bytes
@@ -129,6 +133,12 @@ struct mali_descriptor_pool {
    BITSET_WORD *free_sets;      /* bit i: sets[i] is free */
    uint32_t free_word_hint;
    struct mali_descriptor_set *sets;
+
+   /* Storage is proportional to the pool's dynamic descriptor counts. */
+   struct mali_dynamic_buffer *dyn_bufs;
+   struct util_vma_heap dyn_heap;
+   uint64_t dyn_capacity;
+   uint64_t dyn_next;
 
    /* Created without FREE_DESCRIPTOR_SET_BIT: its sets go only with a
     * reset, so they are taken in order (sets[next], memory at bump) and

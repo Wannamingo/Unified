@@ -702,6 +702,9 @@ pool_release_set(struct mali_device *dev, struct mali_descriptor_pool *pool,
    uint32_t type_counts[MALI_DESC_TYPE_COUNT];
    if (set->gpu && heap_free)
       util_vma_heap_free(&pool->heap, set->gpu, mali_descriptor_set_size(set));
+   if (set->dyn_bufs && heap_free)
+      util_vma_heap_free(&pool->dyn_heap, set->dyn_bufs - pool->dyn_bufs + 1,
+                        layout->dyn_buf_count);
    const uint32_t *counts = set_type_counts(layout, set->variable_count, type_counts);
    for (unsigned t = 0; t < MALI_DESC_TYPE_COUNT; t++)
       pool->avail[t] += counts[t];
@@ -737,6 +740,7 @@ pool_reset(struct mali_device *dev, struct mali_descriptor_pool *pool)
       assert(pool->live_sets == 0);
       pool->next = 0;
       pool->bump = 0;
+      pool->dyn_next = 0;
       return;
    }
    if (!pool->live_sets)
@@ -748,6 +752,10 @@ pool_reset(struct mali_device *dev, struct mali_descriptor_pool *pool)
       util_vma_heap_finish(&pool->heap);
       util_vma_heap_init(&pool->heap, pool->bo.gpu_va, pool->heap_size);
    }
+   if (pool->dyn_capacity) {
+      util_vma_heap_finish(&pool->dyn_heap);
+      util_vma_heap_init(&pool->dyn_heap, 1, pool->dyn_capacity);
+   }
 }
 
 static void
@@ -758,9 +766,14 @@ pool_destroy(struct mali_device *dev, const VkAllocationCallbacks *alloc,
    for (uint32_t i = 0; i < pool->held_count; i++)
       vk_descriptor_set_layout_unref(&dev->vk, &pool->held[i]->vk);
    pool->held_count = 0;
+   if (pool->dyn_capacity && !pool->linear)
+      util_vma_heap_finish(&pool->dyn_heap);
    if (pool->bo.gpu_va) {
       util_vma_heap_finish(&pool->heap);
-      mali_kbase_free(dev->kbase, &pool->bo);
+      if (pool->page.slab)
+         mali_bo_pool_free(&dev->descriptor_pages, &pool->page);
+      else
+         mali_kbase_free(dev->kbase, &pool->bo);
    }
    vk_free2(&dev->vk.alloc, alloc, pool->host);
    vk_object_free(&dev->vk, alloc, pool);
@@ -774,15 +787,27 @@ MALI_PER_ARCH(CreateDescriptorPool)(VkDevice _device, const VkDescriptorPoolCrea
    VK_FROM_HANDLE(mali_device, dev, _device);
    const uint32_t max_sets = pCreateInfo->maxSets;
 
+   uint64_t dyn_capacity = 0;
+   for (uint32_t i = 0; i < pCreateInfo->poolSizeCount; i++) {
+      const VkDescriptorPoolSize *ps = &pCreateInfo->pPoolSizes[i];
+      if (vk_descriptor_type_is_dynamic(ps->type))
+         dyn_capacity += ps->descriptorCount;
+   }
+   dyn_capacity = MIN2(dyn_capacity, (uint64_t)max_sets * MALI_MAX_DYNAMIC_BUFFERS);
+   if (dyn_capacity > SIZE_MAX / sizeof(struct mali_dynamic_buffer))
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
    VK_MULTIALLOC(ma);
    VK_MULTIALLOC_DECL(&ma, struct mali_descriptor_pool, pool, 1);
    VK_MULTIALLOC_DECL(&ma, BITSET_WORD, free_sets, BITSET_WORDS(max_sets));
    VK_MULTIALLOC_DECL(&ma, struct mali_descriptor_set, sets, max_sets);
+   VK_MULTIALLOC_DECL(&ma, struct mali_dynamic_buffer, dyn_bufs, dyn_capacity);
    if (!vk_object_multizalloc(&dev->vk, &ma, pAllocator, VK_OBJECT_TYPE_DESCRIPTOR_POOL))
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    pool->max_sets = max_sets;
    pool->sets = sets;
+   pool->dyn_bufs = dyn_bufs;
    pool->free_sets = free_sets;
    BITSET_SET_COUNT(free_sets, 0, max_sets);
    pool->linear = !(pCreateInfo->flags & VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT);
@@ -824,7 +849,14 @@ MALI_PER_ARCH(CreateDescriptorPool)(VkDevice _device, const VkDescriptorPoolCrea
          .flags = mali_kbase_mem_same_va_policy(MALI_DESC_POOL_FLAGS),
          .mem_class = MALI_KBASE_MEM_CLASS_DESCRIPTOR_POOL,
       };
-      enum mali_kbase_result r = mali_kbase_alloc(dev->kbase, &ai, &pool->bo);
+      enum mali_kbase_result r;
+      if (PAN_ARCH >= 10 && ai.size <= 4096) {
+         r = mali_bo_pool_alloc(&dev->descriptor_pages, 4096, 4096, &pool->page);
+         pool->bo.cpu = pool->page.cpu;
+         pool->bo.gpu_va = pool->page.gpu_va;
+      } else {
+         r = mali_kbase_alloc(dev->kbase, &ai, &pool->bo);
+      }
       if (r != MALI_KBASE_SUCCESS) {
          vk_object_free(&dev->vk, pAllocator, pool);
          return vk_errorf(dev, r == MALI_KBASE_ERROR_OUT_OF_HOST_MEMORY ?
@@ -851,6 +883,9 @@ MALI_PER_ARCH(CreateDescriptorPool)(VkDevice _device, const VkDescriptorPoolCrea
 #endif
    }
 
+   pool->dyn_capacity = dyn_capacity;
+   if (dyn_capacity && !pool->linear)
+      util_vma_heap_init(&pool->dyn_heap, 1, dyn_capacity);
    *pDescriptorPool = mali_descriptor_pool_to_handle(pool);
    return VK_SUCCESS;
 }
@@ -965,6 +1000,28 @@ pool_alloc_set(struct mali_device *dev, struct mali_descriptor_pool *pool,
          return VK_ERROR_FRAGMENTED_POOL;
    }
 
+   struct mali_dynamic_buffer *dyn_bufs = NULL;
+   if (layout->dyn_buf_count) {
+      uint64_t start = 0;
+      if (pool->linear) {
+         if (layout->dyn_buf_count <= pool->dyn_capacity - pool->dyn_next) {
+            start = pool->dyn_next + 1;
+            pool->dyn_next += layout->dyn_buf_count;
+         }
+      } else if (pool->dyn_capacity) {
+         start = util_vma_heap_alloc(&pool->dyn_heap, layout->dyn_buf_count, 1);
+      }
+      if (!start) {
+         if (pool->linear)
+            pool->bump -= size;
+         else if (gpu)
+            util_vma_heap_free(&pool->heap, gpu, size);
+         return pool->linear ? VK_ERROR_OUT_OF_POOL_MEMORY : VK_ERROR_FRAGMENTED_POOL;
+      }
+      dyn_bufs = pool->dyn_bufs + start - 1;
+      memset(dyn_bufs, 0, layout->dyn_buf_count * sizeof(*dyn_bufs));
+   }
+
    if (pool->linear)
       pool->next++;
    assert(i < pool->max_sets);
@@ -982,6 +1039,7 @@ pool_alloc_set(struct mali_device *dev, struct mali_descriptor_pool *pool,
    set->pool = pool;
    set->layout = layout;
    set->desc_count = slots;
+   set->dyn_bufs = dyn_bufs;
    set->variable_count = layout->has_variable_count ? variable_count : 0;
    set->gpu = gpu;
    set->cpu = gpu ? (uint8_t *)pool->bo.cpu + (gpu - pool->bo.gpu_va) : NULL;
@@ -1021,6 +1079,7 @@ MALI_PER_ARCH(AllocateDescriptorSets)(VkDevice _device, const VkDescriptorSetAll
    /* A linear pool's position, put back if this call fails. */
    const uint32_t next = pool->next;
    const uint64_t bump = pool->bump;
+   const uint64_t dyn_next = pool->dyn_next;
    /* Without the structure, or with a count of zero sets in it, the
     * variable counts are zero. */
    const VkDescriptorSetVariableDescriptorCountAllocateInfo *var_counts =
@@ -1056,6 +1115,7 @@ MALI_PER_ARCH(AllocateDescriptorSets)(VkDevice _device, const VkDescriptorSetAll
    if (pool->linear) {
       pool->next = next;
       pool->bump = bump;
+      pool->dyn_next = dyn_next;
    }
    for (uint32_t j = 0; j < pAllocateInfo->descriptorSetCount; j++)
       pDescriptorSets[j] = VK_NULL_HANDLE;

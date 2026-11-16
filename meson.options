@@ -18,3 +18,6 @@ option(
 
 option('unified_geometry_lab', type : 'boolean', value : false,
   description : 'Enable the experimental CSF geometry shader path')
+
+option('unified_tessellation_lab', type : 'boolean', value : false,
+  description : 'Enable the experimental CSF TCS/TES path for direct patch draws')
