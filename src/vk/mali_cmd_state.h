@@ -204,6 +204,9 @@ mali_compute_fau(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
    sv.local_group_size.y = cs->cs.local_size[1];
    sv.local_group_size.z = cs->cs.local_size[2];
    sv.common.push_uniforms = p.gpu;
+#if PAN_ARCH == 11
+   sv.common.poly_params = cmd->poly_params;
+#endif
 #if PAN_ARCH < 9
    sv.common.constant_data = cs->v7.data_mem.gpu_va;
    if (t)
@@ -421,6 +424,9 @@ mali_gfx_fill_sysvals(struct mali_cmd_buffer *cmd, struct mali_graphics_sysvals 
    const struct mali_graphics_pipeline *p = d->pipeline;
 
    memset(sv, 0, sizeof(*sv));
+#if PAN_ARCH == 11
+   sv->common.poly_params = cmd->poly_params;
+#endif
    for (unsigned i = 0; i < 4; i++)
       sv->blend.constants[i] = dyn->cb.blend_constants[i];
 
@@ -679,10 +685,10 @@ mali_gfx_pack_vs_drv(struct mali_cmd_buffer *cmd, const struct mali_shader *vs,
  * (mali_gfx_pack_vs_drv). 0 on failure. *drv (when not NULL): table 0's
  * address, where attribute i's descriptor is the i-th. */
 static inline uint64_t
-mali_gfx_vs_srt_drv(struct mali_cmd_buffer *cmd, uint64_t *drv)
+mali_gfx_shader_vs_srt_drv(struct mali_cmd_buffer *cmd, const struct mali_shader *vs,
+                            uint64_t *drv)
 {
    const struct mali_gfx_draw_state *d = &cmd->gfx.draw;
-   const struct mali_shader *vs = d->pipeline->vs;
    const struct vk_vertex_input_state *vi = d->vi;
    uint32_t vb_offset, vb_count;
    const uint32_t count = mali_gfx_vs_drv_count(vs, vi, &vb_offset, &vb_count);
@@ -693,6 +699,12 @@ mali_gfx_vs_srt_drv(struct mali_cmd_buffer *cmd, uint64_t *drv)
    if (drv)
       *drv = p.gpu;
    return mali_gfx_res_table(cmd, vs, &cmd->gfx.desc, p.gpu, count);
+}
+
+static inline uint64_t
+mali_gfx_vs_srt_drv(struct mali_cmd_buffer *cmd, uint64_t *drv)
+{
+   return mali_gfx_shader_vs_srt_drv(cmd, cmd->gfx.draw.pipeline->vs, drv);
 }
 
 static inline uint64_t
@@ -1243,6 +1255,7 @@ mali_gfx_update_dirty(struct mali_cmd_buffer *cmd, const struct mali_draw_info *
             .vs = p->vs,
             .fs = p->fs,
             .view_mask = p->state.rp.view_mask,
+            .geometry = p->geometry.vertex ? &p->geometry.gs : NULL,
          };
          d->dyn_baked.uses_dynamic_state = true;
          MALI_PER_ARCH(gfx_pack_state)(&in, &d->dyn_baked);

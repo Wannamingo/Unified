@@ -131,6 +131,10 @@ draw_indirect(struct mali_cmd_buffer *cmd, bool indexed, uint64_t params, uint32
       return;
    if (mali_gfx_discards(cmd))
       return;
+   if (d->pipeline->geometry.vertex) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return;
+   }
 
    /* The state of a draw with first vertex 0 and first instance 0: what
     * the stream then stores into the per-draw copies is the rest. */

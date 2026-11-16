@@ -995,7 +995,7 @@ MALI_PER_ARCH(fb_build)(struct mali_cmd_buffer *cmd, struct mali_render_state *r
                         uint32_t *size_out)
 {
    const struct mali_fb_target *zt = &r->desc.z, *st = &r->desc.s;
-   r->crc_rt = select_crc_rt(r);
+   r->crc_rt = r->ir_descriptors ? -1 : select_crc_rt(r);
    const bool crc = r->crc_rt >= 0;
    const bool has_zs = zt->image || st->image || crc;
    const uint32_t layers = MAX2(r->desc.layer_count, 1);
@@ -1162,16 +1162,17 @@ set_target(struct mali_fb_target *t, const struct mali_image_view *view, unsigne
 }
 
 static void
-set_resolve(struct mali_fb_resolve *r, const VkRenderingAttachmentInfo *att)
+set_resolve(struct mali_fb_resolve *r, const VkRenderingAttachmentInfo *att,
+            VkImageAspectFlagBits aspect)
 {
    if (att->resolveMode == VK_RESOLVE_MODE_NONE || !att->resolveImageView) return;
    VK_FROM_HANDLE(mali_image_view, view, att->resolveImageView);
    r->image = container_of(view->vk.image, struct mali_image, vk);
-   r->plane = mali_image_aspect_plane(r->image, view->vk.aspects);
+   r->plane = mali_image_aspect_plane(r->image, aspect);
    r->level = view->vk.base_mip_level;
    r->layer = view->vk.base_array_layer;
    r->mode = att->resolveMode;
-   r->format = vk_format_to_pipe_format(view->vk.view_format);
+   r->format = r->image->planes[r->plane].format;
 }
 
 /* A logical suspension preserves attachments regardless of the final store
@@ -1247,7 +1248,7 @@ MALI_PER_ARCH(CmdBeginRendering)(VkCommandBuffer commandBuffer, const VkRenderin
          unsigned plane = mali_image_aspect_plane(img, VK_IMAGE_ASPECT_DEPTH_BIT);
          set_target(&d.z, view, plane, img->planes[plane].format, za);
          d.clear_depth = za->clearValue.depthStencil.depth;
-         set_resolve(&d.resolve_z, za);
+         set_resolve(&d.resolve_z, za, VK_IMAGE_ASPECT_DEPTH_BIT);
          if (d.resolve_z.image) d.z.store = true;
       }
       w = MIN2(w, view->vk.extent.width);
@@ -1263,7 +1264,7 @@ MALI_PER_ARCH(CmdBeginRendering)(VkCommandBuffer commandBuffer, const VkRenderin
          unsigned plane = mali_image_aspect_plane(img, VK_IMAGE_ASPECT_STENCIL_BIT);
          set_target(&d.s, view, plane, img->planes[plane].format, sa);
          d.clear_stencil = sa->clearValue.depthStencil.stencil;
-         set_resolve(&d.resolve_s, sa);
+         set_resolve(&d.resolve_s, sa, VK_IMAGE_ASPECT_STENCIL_BIT);
          if (d.resolve_s.image) d.s.store = true;
       }
       w = MIN2(w, view->vk.extent.width);

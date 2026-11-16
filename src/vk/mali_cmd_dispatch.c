@@ -91,7 +91,9 @@ dispatch(struct mali_cmd_buffer *cmd, const struct mali_shader *cs,
    const struct mali_thread_props tp = mali_thread_props(cmd->dev);
 
    uint64_t fau = mali_compute_fau(cmd, cs, push, push_size, base, groups);
-   uint64_t srt = mali_compute_res_table(cmd, cs, desc, textures, texture_count);
+   uint64_t srt = cs->desc.driver_table_prefix == MALI_MAX_VS_ATTRIBS ?
+      mali_gfx_shader_vs_srt_drv(cmd, cs, NULL) :
+      mali_compute_res_table(cmd, cs, desc, textures, texture_count);
    uint64_t tsd = mali_compute_tsd(cmd, cs, &tp, indirect ? NULL : groups);
    if (vk_command_buffer_has_error(&cmd->vk) || !srt || !tsd ||
        (cs->fau.total_count && !fau))

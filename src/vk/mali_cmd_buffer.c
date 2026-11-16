@@ -257,6 +257,7 @@ cmd_reset_state(struct mali_cmd_buffer *cmd)
    memset(&cmd->gfx, 0, sizeof(cmd->gfx));
    cmd->gfx.draw.dirty = MALI_GFX_DIRTY_ALL;
    cmd->dispatches = 0;
+   cmd->poly_params = 0;
    cmd->draws = 0;
    cmd->passes = 0;
 }

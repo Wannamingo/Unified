@@ -36,6 +36,9 @@ mali_instance_set_kbase_backend(const struct mali_kbase_backend *backend)
  */
 static const struct vk_instance_extension_table mali_instance_extensions = {
    .KHR_get_physical_device_properties2 = true,
+   /* The Vulkan 1.1 external-memory queries are already implemented.
+    * Wine and Android wrappers also request them by extension name. */
+   .KHR_external_memory_capabilities = true,
    .EXT_debug_utils = true,
 #ifndef __ANDROID__
    /* Mesa's shared WSI, VK_KHR_display only for now (mali_wsi_linux.c):
@@ -48,7 +51,6 @@ static const struct vk_instance_extension_table mali_instance_extensions = {
    /* Vulkan 1.1 core, listed for Arm's WSI layer: for an application that
     * asks for Vulkan 1.0 (vkmark, vkcube) it enables these by name. */
    .KHR_external_fence_capabilities = true,
-   .KHR_external_memory_capabilities = true,
    .KHR_external_semaphore_capabilities = true,
 #endif
 };

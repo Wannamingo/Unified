@@ -15,3 +15,6 @@ option(
   value : false,
   description : 'Private Vulkan1.2/SPIRV1.5 admission lab on v9/v11; not release conformance. Default stays Vulkan1.1.',
 )
+
+option('unified_geometry_lab', type : 'boolean', value : false,
+  description : 'Enable the experimental CSF geometry shader path')

@@ -18,11 +18,14 @@
 #include "vk_alloc.h"
 #include "vk_log.h"
 #include "vk_util.h"
+#include "vk_format.h"
+#include "vk_ycbcr_conversion.h"
 
 #include "util/mesa-blake3.h"
 
 #include "mali_descriptor_set.h"
 #include "mali_descriptor_set_layout.h"
+#include "mali_image.h"
 
 static bool
 has_texture(VkDescriptorType type)
@@ -43,6 +46,28 @@ has_sampler(VkDescriptorType type)
 {
    return type == VK_DESCRIPTOR_TYPE_SAMPLER ||
           type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+}
+
+static unsigned
+sampler_plane_count(const struct mali_sampler *sampler)
+{
+   if (!sampler->vk.ycbcr_conversion)
+      return 1;
+   return vk_format_get_plane_count(sampler->vk.ycbcr_conversion->state.format);
+}
+
+static unsigned
+binding_plane_count(const VkDescriptorSetLayoutBinding *binding)
+{
+   unsigned planes = 1;
+   if (binding->descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
+       binding->pImmutableSamplers) {
+      for (unsigned i = 0; i < binding->descriptorCount; ++i) {
+         VK_FROM_HANDLE(mali_sampler, sampler, binding->pImmutableSamplers[i]);
+         planes = MAX2(planes, sampler_plane_count(sampler));
+      }
+   }
+   return planes;
 }
 
 static bool
@@ -105,6 +130,8 @@ mali_CreateDescriptorSetLayout(VkDevice _device,
    VK_MULTIALLOC_DECL(&ma, struct mali_descriptor_set_binding_layout, blayouts,
                       binding_count);
    VK_MULTIALLOC_DECL(&ma, struct mali_hw_desc, samplers, immutable_count);
+   VK_MULTIALLOC_DECL(&ma, struct vk_ycbcr_conversion_state, conversions,
+                      mali_ycbcr_enabled(mali_device_physical(dev)->arch) ? immutable_count : 0);
 
    if (!vk_descriptor_set_layout_multizalloc(&dev->vk, &ma, pCreateInfo)) {
       free(bindings);
@@ -153,10 +180,20 @@ mali_CreateDescriptorSetLayout(VkDevice _device,
 
       if (has_sampler(bl->type) && b->pImmutableSamplers) {
          bl->immutable_samplers = samplers;
+         if (bl->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+            bl->textures_per_desc = binding_plane_count(b);
+         if (bl->textures_per_desc > 1)
+            bl->immutable_ycbcr = conversions;
          for (uint32_t j = 0; j < b->descriptorCount; j++) {
             VK_FROM_HANDLE(mali_sampler, sampler, b->pImmutableSamplers[j]);
             samplers[j] = sampler->desc;
+            if (bl->immutable_ycbcr && sampler->vk.ycbcr_conversion) {
+               conversions[j] = sampler->vk.ycbcr_conversion->state;
+               layout->type_counts[bl->type] += sampler_plane_count(sampler) - 1;
+            }
          }
+         if (bl->immutable_ycbcr)
+            conversions += b->descriptorCount;
          samplers += b->descriptorCount;
          layout->has_immutable_samplers = true;
       }
@@ -212,6 +249,9 @@ mali_CreateDescriptorSetLayout(VkDevice _device,
       _mesa_blake3_update(&ctx, &bl->api_count, sizeof(bl->api_count));
       _mesa_blake3_update(&ctx, &bl->textures_per_desc, sizeof(bl->textures_per_desc));
       _mesa_blake3_update(&ctx, &bl->samplers_per_desc, sizeof(bl->samplers_per_desc));
+      if (bl->immutable_ycbcr)
+         _mesa_blake3_update(&ctx, bl->immutable_ycbcr,
+                            bl->desc_count * sizeof(*bl->immutable_ycbcr));
    }
    _mesa_blake3_final(&ctx, layout->vk.blake3);
 
@@ -267,7 +307,7 @@ mali_GetDescriptorSetLayoutSupport(VkDevice _device,
             binding_slots = mali_iub_desc_count(count);
          break;
       case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
-         binding_slots = 2ull * count;
+         binding_slots = (1ull + binding_plane_count(b)) * count;
          break;
       default:
          binding_slots = count;
@@ -276,7 +316,8 @@ mali_GetDescriptorSetLayoutSupport(VkDevice _device,
       slots += binding_slots;
       if (variable) {
          variable_inline = b->descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK;
-         variable_stride = b->descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ? 2 : 1;
+         variable_stride = b->descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ?
+                           1 + binding_plane_count(b) : 1;
       } else
          fixed_slots += binding_slots;
    }

@@ -83,13 +83,13 @@ struct mali_descriptor_set_binding_layout {
    /* First slot in the set; for dynamic buffers, the index among the set's
     * dynamic buffers. */
    uint32_t desc_idx;
-   uint32_t textures_per_desc;  /* 1 if the type has a texture, else 0 */
+   uint32_t textures_per_desc;  /* One slot per sampled plane */
    uint32_t samplers_per_desc;  /* 1 if the type has a sampler, else 0 */
    /* The Sampler descriptors of pImmutableSamplers (desc_count entries),
     * copied at layout creation so the samplers may be destroyed afterwards,
-    * or NULL. Written into every set at allocation; the shader side does
-    * not use them (no YCbCr conversion). */
+    * or NULL. Written into every set at allocation. */
    const struct mali_hw_desc *immutable_samplers;
+   const struct vk_ycbcr_conversion_state *immutable_ycbcr;
 };
 
 struct mali_descriptor_set_layout {

@@ -270,6 +270,9 @@ struct mali_render_state {
     * seed (mali_fb_build). */
    int crc_rt;
    uint32_t crc_clear_lo;
+   bool ir_descriptors; /* use identical geometry but no CRC for pass variants */
+   struct mali_tiler_arm *ir_arm;
+   uint64_t ir_last;
 
    /* The Tiler Context's and Framebuffer Parameters' First provoking
     * vertex bit (provokingVertexModePerPipeline is false: one mode for
@@ -292,6 +295,13 @@ struct mali_render_state {
    /* Timing regions of the pass, 0 when not timed. */
    uint32_t measure_vt, measure_frag;
 };
+
+bool mali_tiler_ir_arm(struct mali_cmd_buffer *cmd, struct mali_render_state *r);
+bool mali_tiler_ir_eligible(const struct mali_render_state *r);
+bool mali_tiler_ir_prepare(struct mali_cmd_buffer *cmd, struct mali_render_state *r,
+                           uint32_t stride);
+void mali_tiler_ir_finish(struct mali_cmd_buffer *cmd, const struct mali_render_state *r,
+                          uint64_t regular);
 
 /* Graphics state registers the next draw has to (re)write. */
 enum mali_gfx_dirty {

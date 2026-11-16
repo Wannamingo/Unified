@@ -50,6 +50,8 @@
 #include "pan_format.h"
 #endif
 #include "mali_vk.h"
+#include "vk_nir_convert_ycbcr.h"
+#include "vk_ycbcr_conversion.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -1309,6 +1311,25 @@ layout_check_instr(nir_builder *b, nir_instr *instr, void *data)
    return false;
 }
 
+#if PAN_ARCH >= 10
+static const struct vk_ycbcr_conversion_state *
+ycbcr_conversion(const void *data, uint32_t set, uint32_t binding, uint32_t index)
+{
+   const struct vk_pipeline_layout *layout = data;
+   if (set >= layout->set_count || !layout->set_layouts[set])
+      return NULL;
+   const struct mali_descriptor_set_layout *sl =
+      mali_descriptor_set_layout(layout->set_layouts[set]);
+   if (binding >= sl->binding_count)
+      return NULL;
+   const struct mali_descriptor_set_binding_layout *bl = &sl->bindings[binding];
+   if (!bl->immutable_ycbcr || index >= bl->desc_count ||
+       bl->immutable_ycbcr[index].format == VK_FORMAT_UNDEFINED)
+      return NULL;
+   return &bl->immutable_ycbcr[index];
+}
+#endif
+
 /* Resource lowering (panvk_lower_nir). On v7, a table map that cannot be
  * allocated sets s->v7.failed and ends the lowering early. */
 static VkResult
@@ -1331,6 +1352,11 @@ lower_nir(struct mali_device *dev, nir_shader *nir, const struct mali_shader_com
       .is_vulkan = true,
    };
    NIR_PASS(_, nir, nir_opt_access, &access_options);
+
+#if PAN_ARCH >= 10
+   if (dev->vk.enabled_features.samplerYcbcrConversion)
+      NIR_PASS(_, nir, nir_vk_lower_ycbcr_tex, ycbcr_conversion, info->layout);
+#endif
 
    if (rs->images == VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_ROBUST_IMAGE_ACCESS_EXT) {
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_robust_storage_image,
@@ -2595,7 +2621,7 @@ MALI_PER_ARCH(shader_compile)(struct mali_device *dev,
       break;
 
    case MESA_SHADER_COMPUTE: {
-      s->desc.driver_table_prefix = 0;
+      s->desc.driver_table_prefix = info->poly_vertex_inputs ? MALI_MAX_VS_ATTRIBS : 0;
 #if PAN_ARCH >= 9
       nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
       s->info.cs.allow_merging_workgroups = valhall_can_merge_workgroups(nir);

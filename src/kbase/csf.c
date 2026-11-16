@@ -38,9 +38,8 @@ mali_kbase_group_create(struct mali_kbase *kb,
                         uint8_t *handle)
 {
    /* Tiler endpoint 0 only, every fragment and compute endpoint, at most
-    * 1 tiler and 64 fragment/compute endpoints, no CSI exception handlers
-    * (no incremental rendering). UK >= 1.19 form of the ioctl; we only
-    * speak 1.20. */
+    * 1 tiler and 64 fragment/compute endpoints. UK >= 1.19 form of the
+    * ioctl; we only speak 1.20. */
    union kb_ioctl_cs_queue_group_create gc;
    memset(&gc, 0, sizeof(gc));
    gc.in.tiler_mask = 1;
@@ -51,6 +50,8 @@ mali_kbase_group_create(struct mali_kbase *kb,
    gc.in.tiler_max = 1;
    gc.in.fragment_max = 64;
    gc.in.compute_max = 64;
+   /* BASE_CSF_TILER_OOM_EXCEPTION_FLAG (UK >= 1.12). */
+   gc.in.csi_handlers = info->tiler_oom_handler ? 1 : 0;
 
    long ret = kb_ioctl(kb, KB_IOCTL_CS_QUEUE_GROUP_CREATE, &gc);
    if (ret < 0) {

@@ -146,10 +146,8 @@ VkResult
 mali_wsi_ahb_usage(struct mali_physical_device *pdev, const VkPhysicalDeviceImageFormatInfo2 *info,
                    uint64_t *usage)
 {
-   const VkImageCreateFlags mutable_format =
-      VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
    if (info->type != VK_IMAGE_TYPE_2D || info->tiling != VK_IMAGE_TILING_OPTIMAL ||
-       (info->flags & ~mutable_format))
+       (info->flags & ~MALI_AHB_IMAGE_CREATE_FLAGS))
       return wsi_errorf(pdev, VK_ERROR_FORMAT_NOT_SUPPORTED,
                        "hardware-buffer images of type %d, tiling %d, flags 0x%x are not "
                        "supported", info->type, info->tiling, info->flags);

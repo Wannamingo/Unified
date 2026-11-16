@@ -247,6 +247,7 @@ idep_vulkan_lite_runtime = declare_dependency(
 # the GLSL type singleton that NIR needs, as in Mesa's full runtime.
 _runtime_names = [
   'vk_nir.c',
+  'vk_nir_convert_ycbcr.c',
   'vk_nir_lower_descriptor_heaps.c',
   'vk_pipeline.c',
   'vk_pipeline_cache.c',

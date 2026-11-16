@@ -260,6 +260,19 @@ write_image(const struct mali_descriptor_set *set, const VkDescriptorImageInfo *
 {
    VK_FROM_HANDLE(mali_image_view, view, info->imageView);
    const enum mali_subdesc sub = tex_subdesc(type);
+   const struct mali_descriptor_set_binding_layout *bl = &set->layout->bindings[binding];
+
+   if (type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && bl->textures_per_desc > 1) {
+      uint8_t *slot = slot_ptr(set, binding, elem, sub);
+      const struct mali_hw_desc null_desc = {0};
+      for (unsigned i = 0; i < bl->textures_per_desc; ++i) {
+         const void *desc = &null_desc;
+         if (view && i < view->tex_plane_count)
+            desc = i ? view->tex_planes[i - 1] : view->tex;
+         set_store(set, slot + i * MALI_DESCRIPTOR_SIZE, desc, MALI_DESCRIPTOR_SIZE);
+      }
+      return;
+   }
 
    if (view && type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && view->has_storage_tex)
       write_slot(set, binding, elem, sub, view->storage_tex);
@@ -516,8 +529,14 @@ copy_binding_descriptors(const VkCopyDescriptorSet *c)
          uint8_t *d = slot_ptr(dst, c->dstBinding, c->dstArrayElement + i,
                                MALI_SUBDESC_NONE);
          uint32_t n = stride;
-         if (dbl->immutable_samplers && dbl->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
-            n = dbl->textures_per_desc;
+         if (dbl->immutable_samplers && dbl->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+            n = MIN2(dbl->textures_per_desc, sbl->textures_per_desc);
+            set_store(dst, d, set_load_ptr(src, s), (size_t)n * MALI_DESCRIPTOR_SIZE);
+            const struct mali_hw_desc null_desc = {0};
+            for (unsigned p = n; p < dbl->textures_per_desc; ++p)
+               set_store(dst, d + p * MALI_DESCRIPTOR_SIZE, &null_desc, MALI_DESCRIPTOR_SIZE);
+            continue;
+         }
          else if (dbl->immutable_samplers)
             n = 0;
          set_store(dst, d, set_load_ptr(src, s), (size_t)n * MALI_DESCRIPTOR_SIZE);
@@ -782,7 +801,8 @@ MALI_PER_ARCH(CreateDescriptorPool)(VkDevice _device, const VkDescriptorPoolCrea
       if (vk_descriptor_type_is_dynamic(ps->type))
          continue;
       if (ps->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
-         slots += 2ull * ps->descriptorCount;
+         slots += (mali_ycbcr_enabled(mali_device_physical(dev)->arch) ? 4ull : 2ull) *
+                  ps->descriptorCount;
       else if (ps->type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK)
          slots += DIV_ROUND_UP((uint64_t)ps->descriptorCount, MALI_DESCRIPTOR_SIZE);
       else

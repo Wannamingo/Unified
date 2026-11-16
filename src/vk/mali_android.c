@@ -66,7 +66,7 @@ __attribute__((visibility("default"))) struct hwvulkan_module_t HAL_MODULE_INFO_
       .module_api_version = HWVULKAN_MODULE_API_VERSION_0_1,
       .hal_api_version = HARDWARE_MAKE_API_VERSION(1, 0),
       .id = HWVULKAN_HARDWARE_MODULE_ID,
-      .name = "Unified 0.4.57 Vulkan driver (kbase)",
+      .name = "Unified 0.4.59 Vulkan driver (kbase)",
       .author = "ARMSX2 and bmdhacks",
       .methods = &mali_hal_methods,
    },

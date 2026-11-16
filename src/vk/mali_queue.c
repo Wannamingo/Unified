@@ -40,6 +40,7 @@
 #endif
 
 #include "mali_queue.h"
+#include "util/u_debug.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -410,6 +411,9 @@ mali_csf_device_init(struct mali_device *dev)
    csf->sb.all_iters_mask = (uint16_t)BITFIELD_RANGE(MALI_SB_ITER_START, csf->sb.iter_count);
 
    csf->shared_sb = dev->kbase->props.gpu_features & 0x8;
+   csf->tiler_ir = csf->shared_sb && debug_get_bool_option("UNIFIED_TILER_IR", false);
+   csf->tiler_ir_force = csf->tiler_ir && debug_get_bool_option("UNIFIED_TILER_IR_FORCE", false);
+   csf->tiler_ir_stats = csf->tiler_ir && debug_get_bool_option("UNIFIED_TILER_IR_STATS", false);
    csf->preload_track = preload_option("UNIFIED_PRELOAD_TRACK", "debug.unified.preload_track");
    csf->preload_stats = preload_option("UNIFIED_PRELOAD_STATS", "debug.unified.preload_stats");
    if (csf->preload_stats)
@@ -576,8 +580,10 @@ queue_setup_memory(struct mali_device *dev, struct mali_csf_queue *q)
    const uint64_t desc_va = q->heap_block.gpu_va + MALI_TILER_HEAP_DESC_OFFSET;
    const struct mali_kbase_tiler_heap_info hi = {
       .chunk_size = MALI_TILER_HEAP_CHUNK_SIZE,
-      .initial_chunks = 1,
-      .max_chunks = MALI_TILER_HEAP_MAX_CHUNKS,
+      .initial_chunks = dev->csf->tiler_ir ? 4 : 1,
+      .max_chunks = dev->csf->tiler_ir ?
+         CLAMP(debug_get_num_option("UNIFIED_TILER_MAX_CHUNKS", MALI_TILER_HEAP_MAX_CHUNKS),
+               32, MALI_TILER_HEAP_MAX_CHUNKS) : MALI_TILER_HEAP_MAX_CHUNKS,
       .target_in_flight = 0xffff,
       /* The blob takes the group from config option 0x3b, as for
        * MEM_JIT_INIT; 0 as there (kbase/context.c). */
@@ -663,6 +669,15 @@ queue_teardown(struct mali_device *dev, struct mali_csf_queue *q)
    /* The blob's order: group, then the queues, then the heap. */
    if (q->group_created)
       mali_kbase_group_terminate(kb, q->group);
+   if (q->oom_handler.gpu_va) {
+      if (dev->csf && dev->csf->tiler_ir_stats) {
+         const struct mali_cs_subqueue_ctx *frag =
+            (const void *)((const uint8_t *)q->sync_mem.cpu + MALI_QUEUE_CTX_OFFSET(MALI_SUBQUEUE_FRAGMENT));
+         mesa_logi("UNIFIED-TILER-IR forced=%u calls=%u", dev->csf->tiler_ir_force,
+                   __atomic_load_n(&frag->ir_calls, __ATOMIC_RELAXED));
+      }
+      mali_kbase_free(kb, &q->oom_handler);
+   }
    for (unsigned i = 0; i < MALI_SUBQUEUE_COUNT; i++)
       mali_kbase_queue_destroy(kb, &q->sq[i]);
    if (q->heap_created)
@@ -689,10 +704,16 @@ mali_csf_queue_init(struct mali_device *dev, struct mali_queue *queue)
    result = queue_setup_memory(dev, q);
    if (result != VK_SUCCESS)
       goto fail;
+   if (csf->tiler_ir) {
+      result = mali_tiler_oom_init(dev, q);
+      if (result != VK_SUCCESS)
+         goto fail;
+   }
 
    const struct mali_kbase_group_create_info gi = {
       .cs_count = MALI_SUBQUEUE_COUNT,
       .priority = KB_QUEUE_GROUP_PRIORITY_MEDIUM,
+      .tiler_oom_handler = csf->tiler_ir,
    };
    enum mali_kbase_result kr = mali_kbase_group_create(kb, &gi, &q->group);
    if (kr != MALI_KBASE_SUCCESS) {

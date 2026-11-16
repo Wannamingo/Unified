@@ -214,11 +214,10 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct lower_desc_ctx *ctx)
    /* Valhall takes complete handles in nir_tex_src_texture_handle and
     * nir_tex_src_sampler_handle and nothing in texture_index and
     * sampler_index (pan_nir_lower_tex.c). */
+   nir_def *plane_src = nir_steal_tex_src(tex, nir_tex_src_plane);
+   const unsigned plane = plane_src ? nir_src_as_uint(nir_src_for_ssa(plane_src)) : 0;
    int sampler_src_idx = nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
    if (sampler_src_idx >= 0) {
-      nir_def *plane = nir_steal_tex_src(tex, nir_tex_src_plane);
-      assert(!plane || nir_src_as_uint(nir_src_for_ssa(plane)) == 0);
-      (void)plane;
 
       nir_deref_instr *deref = nir_src_as_deref(tex->src[sampler_src_idx].src);
       nir_tex_instr_remove_src(tex, sampler_src_idx);
@@ -260,7 +259,7 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct lower_desc_ctx *ctx)
          binding_layout(ctx, set, binding);
       uint32_t stride = mali_desc_stride(bl);
       uint32_t texture_index =
-         shader_desc_idx(ctx, set, binding, MALI_SUBDESC_TEXTURE) + index_imm * stride;
+         shader_desc_idx(ctx, set, binding, MALI_SUBDESC_TEXTURE) + index_imm * stride + plane;
 
       nir_def *handle = nir_imm_int(b, texture_index);
       if (index_ssa)

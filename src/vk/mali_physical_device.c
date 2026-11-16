@@ -572,7 +572,10 @@ device_extensions_for_arch(uint32_t arch)
     * do not widen v7 or promote the advertised Vulkan API. */
    ext.EXT_scalar_block_layout = arch == 9 || arch == 11;
    ext.KHR_shader_subgroup_extended_types = arch == 9 || arch == 11;
-   ext.EXT_host_query_reset = arch == 9 || arch == 11;
+   ext.EXT_host_query_reset = arch == 7 || arch == 9 || arch == 11;
+   ext.EXT_vertex_attribute_divisor = arch == 11;
+   ext.EXT_host_image_copy = mali_host_copy_enabled(arch);
+   ext.KHR_sampler_ycbcr_conversion = mali_ycbcr_enabled(arch);
    ext.KHR_uniform_buffer_standard_layout = arch == 9 || arch == 11;
    ext.KHR_separate_depth_stencil_layouts = arch == 9 || arch == 11;
    ext.KHR_zero_initialize_workgroup_memory = workgroup_zero_init_for_arch(arch);
@@ -734,7 +737,7 @@ get_features(struct vk_features *f, uint32_t arch)
       .fullDrawIndexUint32 = true,
       .imageCubeArray = true,
       .independentBlend = true,
-      .geometryShader = false,        /* blob: true; no GS in our compiler */
+      .geometryShader = UNIFIED_GEOMETRY_LAB && arch == 11,
       .tessellationShader = false,
       .sampleRateShading = true,
       .dualSrcBlend = dual_src_blend_for_arch(arch),
@@ -849,7 +852,9 @@ get_features(struct vk_features *f, uint32_t arch)
       .synchronization2 = true,
       .privateData = true,
       .pipelineCreationCacheControl = true,
-      .hostQueryReset = arch == 9 || arch == 11,
+      .hostQueryReset = arch == 7 || arch == 9 || arch == 11,
+      .hostImageCopy = mali_host_copy_enabled(arch),
+      .samplerYcbcrConversion = mali_ycbcr_enabled(arch),
       /* VTN lowers explicit SPIR-V UBO offsets/array/matrix strides to
        * byte-addressed loads. Descriptor lowering does not replace them
        * with std140 padding; the FS FAU path also retains byte offsets.
@@ -1170,6 +1175,11 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       .maxVertexInputAttributeOffset = UINT32_MAX,
       .maxVertexInputBindingStride = MESA_VK_MAX_VERTEX_BINDING_STRIDE,
       .maxVertexOutputComponents = 128,
+      .maxGeometryShaderInvocations = 32,
+      .maxGeometryInputComponents = 64,
+      .maxGeometryOutputComponents = 128,
+      .maxGeometryOutputVertices = 256,
+      .maxGeometryTotalOutputComponents = 1024,
       .maxFragmentInputComponents = 128,
       .maxFragmentOutputAttachments = 8,
       /* kraid takes one second colour per shader (location 0). */
@@ -1228,8 +1238,15 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
        * qualification candidate admits D16/D32/S8/D32S8 at4x onv9/v11. */
       .supportedDepthResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
       .supportedStencilResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
-      .independentResolveNone = false,
+      .independentResolveNone = pdev->arch == 11,
       .independentResolve = false,
+
+      .copySrcLayoutCount = mali_host_copy_enabled(pdev->arch) ? MALI_HOST_COPY_LAYOUT_COUNT : 0,
+      .pCopySrcLayouts = mali_host_copy_layouts,
+      .copyDstLayoutCount = mali_host_copy_enabled(pdev->arch) ? MALI_HOST_COPY_LAYOUT_COUNT : 0,
+      .pCopyDstLayouts = mali_host_copy_layouts,
+      .optimalTilingLayoutUUID = "UHIC-color-1",
+      .identicalMemoryTypeRequirements = false,
 
       /* VK_EXT_provoking_vertex: the hardware bit is per render pass, not
        * per pipeline (panvk reports the same). */

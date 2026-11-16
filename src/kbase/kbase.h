@@ -639,6 +639,7 @@ mali_kbase_stream_create(struct mali_kbase *kb, const char *name, int *out_fd);
 struct mali_kbase_group_create_info {
    uint8_t cs_count;       /* CSs the group needs (cs_min) */
    uint8_t priority;       /* KB_QUEUE_GROUP_PRIORITY_* */
+   bool tiler_oom_handler;
 };
 
 enum mali_kbase_result

@@ -72,6 +72,9 @@ struct mali_csf_device {
    bool shared_sb;
    bool preload_track;
    bool preload_stats;
+   bool tiler_ir;
+   bool tiler_ir_force;
+   bool tiler_ir_stats;
 
    /* The event thread: reads the kbase event channel, wakes waiters,
     * turns a queue-group error into device loss. */
@@ -122,6 +125,7 @@ struct mali_csf_queue {
    bool heap_created;
 
    struct mali_kbase_bo sync_mem;
+   struct mali_kbase_bo oom_handler;
    struct mali_kbase_queue sq[MALI_SUBQUEUE_COUNT];
 
    /* Submits handed to the rings so far; submit N writes N into done[]. */
@@ -142,6 +146,8 @@ struct mali_csf_queue {
    uint64_t ring_waited[MALI_SUBQUEUE_COUNT][MALI_SUBQUEUE_COUNT];
    uint64_t handoff[MALI_SUBQUEUE_COUNT];
 };
+
+VkResult mali_tiler_oom_init(struct mali_device *dev, struct mali_csf_queue *q);
 
 static inline volatile struct mali_cs_sync64 *
 mali_queue_done(const struct mali_csf_queue *q)

@@ -30,14 +30,28 @@
 
 #include "util/format/u_format.h"
 #include "util/log.h"
+#include "util/u_debug.h"
 #include "vk_format.h"
 #include "vk_util.h"
 #include "vulkan/vulkan_android.h"
+
+bool
+mali_ycbcr_enabled(uint32_t arch)
+{
+   return arch == 11 && debug_get_bool_option("UNIFIED_YUV", false);
+}
 
 unsigned
 mali_format_planes(VkFormat format, enum pipe_format planes[MALI_IMAGE_MAX_PLANES])
 {
    switch (format) {
+   case VK_FORMAT_G8_B8R8_2PLANE_420_UNORM:
+      planes[0] = PIPE_FORMAT_R8_UNORM;
+      planes[1] = PIPE_FORMAT_R8G8_UNORM;
+      return 2;
+   case VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM:
+      planes[0] = planes[1] = planes[2] = PIPE_FORMAT_R8_UNORM;
+      return 3;
    /* Combined depth/stencil in two planes, as panvk does on arch 9 and
     * later (Z32_S8X24 does not exist there) and as the blob keeps stencil
     * in a second slice array. */
@@ -62,6 +76,14 @@ mali_format_planes(VkFormat format, enum pipe_format planes[MALI_IMAGE_MAX_PLANE
 VkFormatFeatureFlags
 mali_format_image_features(const struct mali_physical_device *pdev, VkFormat format)
 {
+   if (mali_format_is_ycbcr(format)) {
+      if (!mali_ycbcr_enabled(pdev->arch))
+         return 0;
+      return VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+             VK_FORMAT_FEATURE_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+             VK_FORMAT_FEATURE_MIDPOINT_CHROMA_SAMPLES_BIT | VK_FORMAT_FEATURE_COSITED_CHROMA_SAMPLES_BIT |
+             VK_FORMAT_FEATURE_SAMPLED_IMAGE_YCBCR_CONVERSION_LINEAR_FILTER_BIT;
+   }
    return mali_arch_dispatch(pdev->arch, format_image_features, pdev, format);
 }
 
@@ -77,9 +99,19 @@ static VkFormatFeatureFlags
 linear_features(const struct mali_physical_device *pdev, VkFormat format)
 {
    enum pipe_format planes[MALI_IMAGE_MAX_PLANES];
-   if (mali_format_planes(format, planes) > 1)
+   if (mali_format_planes(format, planes) > 1 && !mali_format_is_ycbcr(format))
       return 0;
    return mali_format_image_features(pdev, format);
+}
+
+static bool
+host_copy_format(const struct mali_physical_device *pdev, VkFormat format,
+                 VkFormatFeatureFlags features)
+{
+   return mali_host_copy_enabled(pdev->arch) &&
+          (features & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) &&
+          !vk_format_is_depth_or_stencil(format) &&
+          (vk_format_get_plane_count(format) == 1 || mali_format_is_ycbcr(format));
 }
 
 bool
@@ -119,6 +151,10 @@ mali_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice, VkForma
          p->linearTilingFeatures = linear2;
          p->optimalTilingFeatures = mali_format_features2(
             format, pFormatProperties->formatProperties.optimalTilingFeatures, false);
+         if (host_copy_format(pdev, format, linear))
+            p->linearTilingFeatures |= VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT;
+         if (host_copy_format(pdev, format, pFormatProperties->formatProperties.optimalTilingFeatures))
+            p->optimalTilingFeatures |= VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT;
          p->bufferFeatures = mali_format_features2(
             format, pFormatProperties->formatProperties.bufferFeatures, true);
          break;
@@ -171,6 +207,11 @@ image_format_properties(const struct mali_physical_device *pdev,
       vk_find_struct_const(info->pNext, IMAGE_STENCIL_USAGE_CREATE_INFO);
    const VkImageUsageFlags usage =
       info->usage | (stencil_usage_info ? stencil_usage_info->stencilUsage : 0);
+   const bool ycbcr = mali_format_is_ycbcr(info->format);
+   if (ycbcr && (info->type != VK_IMAGE_TYPE_2D ||
+                 (usage & ~MALI_YCBCR_IMAGE_USAGES) ||
+                 (info->flags & ~MALI_YCBCR_IMAGE_FLAGS)))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
    if (info->flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
                       VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
@@ -204,6 +245,11 @@ image_format_properties(const struct mali_physical_device *pdev,
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
    }
    if (!feat)
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   if ((usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT) &&
+       (!host_copy_format(pdev, info->format, feat) ||
+        info->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT ||
+        usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
    const struct vk_properties *lim = &pdev->vk.properties;
@@ -263,7 +309,7 @@ image_format_properties(const struct mali_physical_device *pdev,
        (feat & (VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
                 VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) &&
        !(info->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) &&
-       !(usage & VK_IMAGE_USAGE_STORAGE_BIT) &&
+       !(usage & (VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_HOST_TRANSFER_BIT)) &&
        (!vk_format_is_depth_or_stencil(info->format) || ds_msaa_candidate)) {
       enum pipe_format planes[MALI_IMAGE_MAX_PLANES];
       mali_format_planes(info->format, planes);
@@ -272,8 +318,8 @@ image_format_properties(const struct mali_physical_device *pdev,
 
    *props = (VkImageFormatProperties) {
       .maxExtent = extent,
-      .maxMipLevels = MALI_IMAGE_MAX_LEVELS,
-      .maxArrayLayers = layers,
+      .maxMipLevels = ycbcr ? 1 : MALI_IMAGE_MAX_LEVELS,
+      .maxArrayLayers = ycbcr ? 1 : layers,
       .sampleCounts = samples,
       /* An image has to fit in one allocation. */
       .maxResourceSize = pdev->vk.properties.maxMemoryAllocationSize,
@@ -305,6 +351,11 @@ mali_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
    const VkPhysicalDeviceExternalImageFormatInfo *ext_info =
       vk_find_struct_const(pInfo->pNext, PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO);
    const VkExternalMemoryHandleTypeFlagBits handle_type = ext_info ? ext_info->handleType : 0;
+   if (handle_type && ((pInfo->usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT) ||
+                       mali_format_is_ycbcr(pInfo->format))) {
+      pProps->imageFormatProperties = (VkImageFormatProperties){0};
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   }
    const bool ahb =
       handle_type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
    const bool dmabuf = handle_type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
@@ -372,7 +423,13 @@ mali_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
       }
       case VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_IMAGE_FORMAT_PROPERTIES: {
          VkSamplerYcbcrConversionImageFormatProperties *y = ext;
-         y->combinedImageSamplerDescriptorCount = 1;
+         y->combinedImageSamplerDescriptorCount = vk_format_get_plane_count(pInfo->format);
+         break;
+      }
+      case VK_STRUCTURE_TYPE_HOST_IMAGE_COPY_DEVICE_PERFORMANCE_QUERY: {
+         VkHostImageCopyDevicePerformanceQuery *q = ext;
+         q->optimalDeviceAccess = pInfo->tiling == VK_IMAGE_TILING_LINEAR;
+         q->identicalMemoryLayout = pInfo->tiling == VK_IMAGE_TILING_LINEAR;
          break;
       }
       default:

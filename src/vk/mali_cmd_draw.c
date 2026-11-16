@@ -34,6 +34,7 @@
 #include "mali_measure.h"
 
 #include "vk_log.h"
+#include "vk_util.h"
 
 #include "mali_arch.h"
 #include "mali_queue.h"
@@ -49,7 +50,7 @@
 bool mali_idvs_bit55 = true;
 
 static void
-draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
+draw_raster(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
 {
    struct mali_gfx_draw_state *d = &cmd->gfx.draw;
    struct mali_render_state *r = &cmd->gfx.render;
@@ -123,6 +124,166 @@ draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
    cmd->draws++;
    if (unlikely(mh))
       mali_measure_end(cmd, mh);
+}
+
+/* Internal shader-output handoff. Do not use ALL_COMMANDS here: the
+ * fragment pass may still be open, and waiting for it would form a cycle. */
+static void
+poly_barrier(struct mali_cmd_buffer *cmd, VkPipelineStageFlags2 dst)
+{
+   const VkMemoryBarrier2 mem = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+      .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+      .srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT,
+      .dstStageMask = dst,
+      .dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT,
+   };
+   const VkDependencyInfo info = {
+      .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+      .memoryBarrierCount = 1, .pMemoryBarriers = &mem,
+   };
+   struct mali_cs_deps deps = {0};
+   mali_cmd_add_deps(cmd, &info, &deps);
+   mali_cmd_emit_barrier(cmd, &deps);
+}
+
+static bool
+poly_geometry_prepare(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di,
+                      struct mali_draw_info *rast)
+{
+   struct mali_gfx_draw_state *d = &cmd->gfx.draw;
+   const struct mali_graphics_pipeline *p = d->pipeline;
+   const struct poly_gs_info *gs = &p->geometry.gs;
+   const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   const enum mesa_prim mode = BITSET_TEST(p->dynamic, MESA_VK_DYNAMIC_IA_PRIMITIVE_TOPOLOGY) ?
+      vk_topology_to_mesa(dyn->ia.primitive_topology) : vk_topology_to_mesa(p->state.ia.primitive_topology);
+   const bool restart = BITSET_TEST(p->dynamic, MESA_VK_DYNAMIC_IA_PRIMITIVE_RESTART_ENABLE) ?
+      dyn->ia.primitive_restart_enable : p->state.ia.primitive_restart_enable;
+   /* Primitive restart is an index-buffer operation. The non-indexed
+    * input has no restart tokens, regardless of the pipeline state. */
+   if ((di->indexed && restart) || mode >= MESA_PRIM_PATCHES) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_FEATURE_NOT_PRESENT);
+      return false;
+   }
+   if (di->count > INT32_MAX) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return false;
+   }
+   const uint32_t prims = u_decomposed_prims_for_vertices(mode, di->count);
+   if (!prims)
+      return false;
+   const uint64_t vertex_count = (uint64_t)di->count * di->instance_count;
+   const uint64_t total_prims = (uint64_t)prims * di->instance_count;
+   const uint32_t vertex_stride =
+      MAX2(util_bitcount64(p->geometry.vertex_outputs) * 16, 1);
+   const uint32_t count_stride = MAX2(gs->count_words, 1) * 4;
+   if (vertex_count > UINT32_MAX / vertex_stride ||
+       total_prims > UINT32_MAX / 4 / MAX2(gs->max_indices, 1) ||
+       total_prims > UINT32_MAX / count_stride) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      return false;
+   }
+   const uint64_t vertices_size = vertex_count * vertex_stride;
+   const uint64_t index_count = gs->max_indices * total_prims;
+   const uint64_t counts_size = total_prims * count_stride;
+   struct mali_ptr root_mem = mali_cmd_alloc(cmd, sizeof(struct mali_poly_params), 16);
+   struct mali_ptr vp_mem = mali_cmd_alloc(cmd, sizeof(struct poly_vertex_params), 16);
+   struct mali_ptr gp_mem = mali_cmd_alloc(cmd, sizeof(struct poly_geometry_params), 16);
+   struct mali_ptr vertices = mali_cmd_alloc(cmd, MAX2(vertices_size, 16), 16);
+   struct mali_ptr indices = mali_cmd_alloc(cmd, MAX2(index_count * 4, 64), 16);
+   struct mali_ptr counts = mali_cmd_alloc(cmd, MAX2(counts_size, 16), 16);
+   struct mali_ptr scratch = mali_cmd_alloc(cmd, 1152, 16);
+   if (!root_mem.cpu || !vp_mem.cpu || !gp_mem.cpu || !vertices.cpu ||
+       !indices.cpu || !counts.cpu || !scratch.cpu) return false;
+   memset(scratch.cpu, 0, 1152);
+   struct mali_poly_params root = {
+      .vertex = vp_mem.gpu, .geometry = gp_mem.gpu, .ro_sink = scratch.gpu,
+      .printf_buffer = scratch.gpu + 128, .first_vertex = di->vertex_offset,
+      .base_instance = di->first_instance,
+      .provoking_last = p->state.rs.provoking_vertex == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT,
+   };
+   for (unsigned i = 0; i < 4; i++) root.stat_query[i] = scratch.gpu + 16 + i * 8;
+   memcpy(root_mem.cpu, &root, sizeof(root));
+   struct poly_vertex_params vp;
+   const uint32_t wg[] = {1, 1, 1};
+   poly_vertex_params_init(&vp, p->geometry.vertex_outputs, wg);
+   poly_vertex_params_set_draw(&vp, di->count, di->instance_count);
+   vp.output_buffer = vertices.gpu;
+   if (di->indexed) {
+      const uint64_t off = (uint64_t)di->first_index * d->ib.index_size;
+      vp.index_size_B = d->ib.index_size;
+      vp.index_buffer = d->ib.addr + MIN2(off, d->ib.size);
+      vp.index_buffer_range_el = d->ib.index_size && off < d->ib.size ?
+         MIN2((d->ib.size - off) / d->ib.index_size, UINT32_MAX) : 0;
+   }
+   memcpy(vp_mem.cpu, &vp, sizeof(vp));
+   struct poly_geometry_params gp;
+   poly_geometry_params_init(&gp, mode, wg);
+   poly_geometry_params_set_draw(&gp, mode, gs->shape, gs->max_indices,
+                                  di->count, di->instance_count);
+   gp.output_index_buffer = indices.gpu;
+   gp.count_buffer = counts.gpu;
+   gp.count_buffer_stride = gs->count_words * 4;
+   for (unsigned i = 0; i < 4; i++)
+      gp.prims_generated_counter[i] = scratch.gpu + 64 + i * 4;
+   memcpy(gp_mem.cpu, &gp, sizeof(gp));
+   cmd->poly_params = root_mem.gpu;
+   d->base_instance = di->first_instance;
+   const uint32_t base[] = {0, 0, 0};
+   uint32_t groups[] = {di->count, di->instance_count, 1};
+#define POLY_DISPATCH(shader_) MALI_PER_ARCH(cmd_dispatch_shader)(cmd, shader_, \
+   &cmd->gfx.desc, cmd->push_constants, sizeof(cmd->push_constants), base, groups)
+   POLY_DISPATCH(p->geometry.vertex);
+   poly_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+   groups[0] = prims;
+   if (p->geometry.count) {
+      POLY_DISPATCH(p->geometry.count);
+      poly_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+   }
+   if (p->geometry.pre) {
+      groups[0] = groups[1] = 1;
+      POLY_DISPATCH(p->geometry.pre);
+      poly_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+   }
+   groups[0] = prims;groups[1] = di->instance_count;
+   POLY_DISPATCH(p->geometry.main);
+#undef POLY_DISPATCH
+   poly_barrier(cmd, VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT);
+   *rast = (struct mali_draw_info){
+      .count = gp.draw.index_count, .instance_count = gp.draw.instance_count,
+      .indexed = poly_gs_indexed(gs->shape),
+   };
+   if (rast->indexed) {
+      d->ib.addr = indices.gpu;
+      d->ib.index_size = poly_gs_index_size(gs->shape);
+      d->ib.size = gs->shape == POLY_GS_SHAPE_STATIC_INDEXED ? gs->max_indices : index_count * 4;
+      if (gs->shape == POLY_GS_SHAPE_STATIC_INDEXED)
+         memcpy(indices.cpu, gs->topology, MIN2(gs->max_indices, sizeof(gs->topology)));
+   }
+   d->dirty |= MALI_GFX_DIRTY_VS_FAU | MALI_GFX_DIRTY_VS_SRT | MALI_GFX_DIRTY_INDEX;
+   return !vk_command_buffer_has_error(&cmd->vk);
+}
+
+static void
+draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
+{
+   struct mali_gfx_draw_state *d = &cmd->gfx.draw;
+   if (!d->pipeline || !d->pipeline->geometry.vertex || !di->count || !di->instance_count) {
+      draw_raster(cmd, di);
+      return;
+   }
+   if (!cmd->gfx.render.active || vk_command_buffer_has_error(&cmd->vk)) return;
+   if (mali_gfx_discards(cmd))
+      return;
+   mali_gfx_collect_dynamic_dirty(cmd);
+   const uint64_t saved_root = cmd->poly_params;
+   const __typeof__(d->ib) saved_ib = d->ib;
+   struct mali_draw_info rast;
+   const bool prepared = poly_geometry_prepare(cmd, di, &rast);
+   if (prepared) draw_raster(cmd, &rast);
+   cmd->poly_params = saved_root;
+   d->ib = saved_ib;
+   d->dirty |= MALI_GFX_DIRTY_VS_FAU | MALI_GFX_DIRTY_VS_SRT | MALI_GFX_DIRTY_INDEX;
 }
 
 VKAPI_ATTR void VKAPI_CALL

@@ -174,6 +174,7 @@ struct mali_cmd_buffer {
 
    /* RUN_COMPUTEs, RUN_IDVSs and render passes recorded (tests,
     * statistics). */
+   uint64_t poly_params;
    uint32_t dispatches;
    uint32_t draws;
    uint32_t passes;

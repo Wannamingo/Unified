@@ -347,8 +347,9 @@ emit_plane(const struct view_src *src, unsigned level, unsigned layer, void *out
       slice_stride = image->vk.samples > 1 ? s->surface_stride : 0;
    }
 #if PAN_ARCH >= 10
-   const uint32_t width = u_minify(image->vk.extent.width, level);
-   const uint32_t height = u_minify(image->vk.extent.height, level);
+   const VkExtent3D extent = mali_image_plane_extent(image, src->plane, level);
+   const uint32_t width = extent.width;
+   const uint32_t height = extent.height;
 #else
    /* 32-bit sizes and strides (no hi words on v9). */
    assert(size <= UINT32_MAX && slice_stride <= UINT32_MAX);
@@ -445,11 +446,7 @@ static VkExtent3D
 view_extent(const struct view_src *src)
 {
    const struct mali_image *image = src->image;
-   VkExtent3D e = {
-      .width = u_minify(image->vk.extent.width, src->first_level),
-      .height = u_minify(image->vk.extent.height, src->first_level),
-      .depth = u_minify(image->vk.extent.depth, src->first_level),
-   };
+   VkExtent3D e = mali_image_plane_extent(image, src->plane, src->first_level);
    const enum pipe_format ifmt = image->planes[src->plane].format;
    if (util_format_is_compressed(ifmt) && !util_format_is_compressed(src->format)) {
       e.width = DIV_ROUND_UP(e.width, util_format_get_blockwidth(ifmt));
@@ -579,10 +576,50 @@ v7_pack_storage_attr_bufs(const struct mali_image_view *view, uint32_t out[8])
 }
 #endif /* PAN_ARCH < 9 */
 
+static VkResult
+ycbcr_view_init_descs(struct mali_device *dev, struct mali_image_view *view,
+                     const struct mali_image *image)
+{
+   /* The runtime expands COLOR to a mask of all planes. The full view still
+    * carries the multi-planar format, unlike a plane-compatible view. */
+   const bool full = mali_format_is_ycbcr(view->vk.view_format);
+   const unsigned selected = mali_image_aspect_plane(image, view->vk.aspects);
+   if (!full)
+      view->vk.extent = mali_image_plane_extent(image, selected, view->vk.base_mip_level);
+   if (!(view->vk.usage & VK_IMAGE_USAGE_SAMPLED_BIT))
+      return VK_SUCCESS;
+   const unsigned count = full ? image->plane_count : 1;
+   if (mali_bo_pool_alloc(&dev->desc_pool, count * PLANE_DESC_SIZE,
+                         PLANE_DESC_SIZE, &view->plane_descs) != MALI_KBASE_SUCCESS)
+      return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+
+   unsigned char swizzle[4] = {PIPE_SWIZZLE_X, PIPE_SWIZZLE_Y, PIPE_SWIZZLE_Z, PIPE_SWIZZLE_W};
+   if (!full)
+      vk_component_mapping_to_pipe_swizzle(view->vk.swizzle, swizzle);
+   for (unsigned p = 0; p < count; ++p) {
+      const unsigned plane = full ? p : selected;
+      const struct view_src src = {
+         .image = image, .plane = plane,
+         .format = full ? image->planes[plane].format :
+                          vk_format_to_pipe_format(view->vk.view_format),
+         .dim = MALI_TEXTURE_DIMENSION_2D, .levels = 1, .layers = 1,
+      };
+      const unsigned offset = p * PLANE_DESC_SIZE;
+      emit_planes(&src, (uint8_t *)view->plane_descs.cpu + offset);
+      pack_texture(&src, swizzle, view->plane_descs.gpu_va + offset, 0, false,
+                   p ? view->tex_planes[p - 1] : view->tex);
+   }
+   view->has_tex = true;
+   view->tex_plane_count = count;
+   return VK_SUCCESS;
+}
+
 VkResult
 MALI_PER_ARCH(image_view_init_descs)(struct mali_device *dev, struct mali_image_view *view)
 {
    const struct mali_image *image = container_of(view->vk.image, struct mali_image, vk);
+   if (mali_format_is_ycbcr(image->vk.format))
+      return ycbcr_view_init_descs(dev, view, image);
    const VkImageUsageFlags usage = view->vk.usage;
    const bool want_tex = usage & (VK_IMAGE_USAGE_SAMPLED_BIT |
                                   VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
@@ -673,6 +710,7 @@ MALI_PER_ARCH(image_view_init_descs)(struct mali_device *dev, struct mali_image_
       emit_planes(&src, cpu);
       pack_texture(&src, swizzle, gpu, view->vk.min_lod, false, view->tex);
       view->has_tex = true;
+      view->tex_plane_count = 1;
       cpu += per_view;
       gpu += per_view;
    }

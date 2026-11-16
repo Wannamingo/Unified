@@ -31,11 +31,11 @@ mali_kraid_support_h = custom_target(
 
 malisx2_compiler = static_library(
   'mali_compiler',
-  files('compiler/mali_compiler.c'), mali_kraid_support_h,
+  files('compiler/mali_compiler.c', 'compiler/mali_poly.c'), mali_kraid_support_h,
   include_directories : [inc_include, inc_src, inc_panfrost],
   c_args : [pre_args, malisx2_c_args],
   dependencies : [idep_vtn, idep_nir, idep_mesautil, idep_valhall_enums_h,
-                  idep_bi_opcodes_h, libpanfrost_model_dep],
+                  idep_bi_opcodes_h, libpanfrost_model_dep, idep_unified_poly],
   link_with : [libpanfrost_compiler],
   gnu_symbol_visibility : 'hidden',
 )
@@ -45,7 +45,7 @@ idep_mali_compiler = declare_dependency(
   link_with : malisx2_compiler,
   include_directories : [include_directories('compiler'), inc_panfrost],
   dependencies : [idep_nir, idep_vtn, idep_mesautil, idep_valhall_enums_h,
-                  idep_bi_opcodes_h, libpanfrost_model_dep],
+                  idep_bi_opcodes_h, libpanfrost_model_dep, idep_unified_poly],
   link_args : _kraid_wrap,
 )
 
@@ -132,6 +132,7 @@ _vk_c_args = [
   '-DMALI_PAN_ARCH=@0@'.format(pan_arch),
   '-DMALI_VERSION_STRING="@0@"'.format(meson.project_version()),
   '-DUNIFIED_API12_LAB=@0@'.format(get_option('unified_api12_lab') ? '1' : '0'),
+  '-DUNIFIED_GEOMETRY_LAB=@0@'.format(get_option('unified_geometry_lab') ? '1' : '0'),
 ]
 
 # The files built once per GPU architecture:
@@ -169,7 +170,8 @@ malisx2_vk = static_library(
         'vk/mali_physical_device.c'),
   # Memory, buffers, images, formats.
   files('vk/mali_buffer.c', 'vk/mali_device_memory.c', 'vk/mali_formats.c',
-        'vk/mali_image.c', 'vk/mali_image_layout.c'),
+        'vk/mali_image.c', 'vk/mali_image_layout.c', 'vk/mali_host_image_copy.c',
+        'vk/unified_host_image_copy_plan.c'),
   # Shader lowering and memory pools, descriptor set layouts.
   files('vk/mali_bo_pool.c', 'vk/mali_descriptor_set_layout.c',
         'vk/mali_nir_lower_descriptors.c', 'vk/mali_nir_lower_input_attachments.c'),
@@ -183,7 +185,8 @@ malisx2_vk = static_library(
   files('vk/mali_cmd_query.c', 'vk/mali_query.c'),
   # Render passes and draws (the CSF side; the shared builders and the
   # image transfers are per-arch files).
-  files('vk/mali_cmd_draw.c', 'vk/mali_cmd_draw_indirect.c', 'vk/mali_cmd_render.c'),
+  files('vk/mali_cmd_draw.c', 'vk/mali_cmd_draw_indirect.c', 'vk/mali_cmd_render.c',
+        'vk/mali_tiler_oom.c'),
   # Sync files and the Android window system; mali_android.c only on Android.
   files('vk/mali_sync_file.c', 'vk/mali_wsi.c'),
   with_platform_android ? files('vk/mali_android.c', 'vk/mali_android_buffer.c') : files('vk/mali_wsi_linux.c'),
@@ -346,3 +349,11 @@ configure_file(
 devenv = environment()
 devenv.set('VK_DRIVER_FILES', meson.current_build_dir() / 'mali_devenv_icd.json')
 meson.add_devenv(devenv)
+
+if get_option('unified_geometry_lab')
+  executable('unified-vtn-bindgen', files(mesa_src / 'compiler/spirv/vtn_bindgen2.c'),
+    include_directories : [inc_include, inc_src],
+    c_args : pre_args, dependencies : [idep_vtn, idep_mesautil],
+    link_language : 'cpp', link_args : ['-Wl,-z,max-page-size=16384'],
+    install : false)
+endif

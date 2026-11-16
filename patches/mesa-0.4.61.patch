@@ -1,0 +1,79 @@
+--- a/src/compiler/nir/nir_gather_info.c
++++ b/src/compiler/nir/nir_gather_info.c
+@@ -588,7 +588,11 @@
+          if (instr->intrinsic == nir_intrinsic_load_per_primitive_input)
+             shader->info.per_primitive_inputs |= slot_mask;
+          shader->info.inputs_read_16bit |= slot_mask_16bit;
+-         if (!nir_src_is_const(*nir_get_io_offset_src(instr))) {
++         /* Mali attribute pulls carry a descriptor handle, not an IO offset.
++          * Software VS lowering can reach gather_info with these intrinsics. */
++         nir_src *offset = instr->intrinsic == nir_intrinsic_load_attr_pan ?
++            &instr->src[2] : nir_get_io_offset_src(instr);
++         if (!nir_src_is_const(*offset)) {
+             shader->info.inputs_read_indirectly |= slot_mask;
+             shader->info.inputs_read_indirectly_16bit |= slot_mask_16bit;
+          }
+--- a/src/compiler/spirv/vtn_variables.c
++++ b/src/compiler/spirv/vtn_variables.c
+@@ -2211,6 +2211,20 @@
+    val->pointer->var = var;
+    val->pointer->access = var->type->access;
+ 
++#ifdef __ANDROID__
++   /* Some Winlator wrappers strip DXVK's ClipDistance decoration while
++    * leaving the unused standalone six-plane output in the entry point.
++    * Track an unassigned location for that shape, so it cannot be
++    * mistaken for gl_Position. Valid Location/BuiltIn still wins. */
++   const bool possible_detached_clip_output =
++      b->options->environment == NIR_SPIRV_VULKAN &&
++      b->shader->info.stage == MESA_SHADER_VERTEX &&
++      var->mode == vtn_variable_mode_output && !val->name &&
++      glsl_type_is_array(var->type->type) &&
++      glsl_array_size(var->type->type) == 6 &&
++      glsl_type_is_scalar(glsl_get_array_element(var->type->type)) &&
++      glsl_get_base_type(glsl_get_array_element(var->type->type)) == GLSL_TYPE_FLOAT;
++#endif
+    switch (var->mode) {
+    case vtn_variable_mode_function:
+    case vtn_variable_mode_private:
+@@ -2278,6 +2292,10 @@
+       nir_variable_set_name(b->shader, var->var, val->name);
+       var->var->type = vtn_type_get_nir_type(b, var->type, var->mode);
+       var->var->data.mode = nir_mode;
++#ifdef __ANDROID__
++      if (possible_detached_clip_output)
++         var->var->data.location = -1;
++#endif
+ 
+       /* In order to know whether or not we're a per-vertex inout, we need
+        * the patch qualifier.  This means walking the variable decorations
+@@ -2463,6 +2481,17 @@
+    vtn_foreach_decoration(b, val, var_decoration_cb, var);
+    vtn_foreach_decoration(b, val, ptr_decoration_cb, val->pointer);
+ 
++#ifdef __ANDROID__
++   if (possible_detached_clip_output && var->var->data.location < 0) {
++      /* The wrapper has already disabled this interface output. Keep any
++       * accesses to it private and let the existing NIR passes remove
++       * dead writes. A decorated clipping output keeps its normal path. */
++      var->var->data.mode = nir_var_shader_temp;
++      var->mode = vtn_variable_mode_private;
++      val->pointer->mode = vtn_variable_mode_private;
++   }
++#endif
++
+    /* Propagate access flags from the OpVariable decorations. */
+    val->pointer->access |= var->access;
+ 
+--- a/src/panfrost/lib/pan_format.c
++++ b/src/panfrost/lib/pan_format.c
+@@ -334,6 +334,9 @@
+    FMT(B5G5R5X1_UNORM,          RGB5_A1_UNORM,   BGR1, L, VT__IB),
+    FMT(R5G5B5A1_UNORM,          RGB5_A1_UNORM,   RGBA, L, VTR_IB),
+    FMT(B5G5R5A1_UNORM,          RGB5_A1_UNORM,   BGRA, L, VTR_IB),
++   /* A in bit zero. This is a different texture encoding from RGB5_A1. */
++   FMT(A1B5G5R5_UNORM,          A1_BGR5_UNORM,   RGBA, L, _T____),
++   FMT(A1R5G5B5_UNORM,          A1_BGR5_UNORM,   BGRA, L, _T____),
+    FMT(R10G10B10X2_UNORM,       RGB10_A2_UNORM,  RGB1, L, VTR_IB),
+    FMT(B10G10R10X2_UNORM,       RGB10_A2_UNORM,  BGR1, L, VTR_IB),
+    FMT(R10G10B10A2_UNORM,       RGB10_A2_UNORM,  RGBA, L, VTR_IB),

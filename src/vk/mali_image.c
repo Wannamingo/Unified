@@ -199,7 +199,8 @@ choose_modifier(const struct mali_image *image, const enum pipe_format *formats,
    /* A scanout buffer (a VK_KHR_display swapchain image): the kernel and
     * the GPU have to agree on the layout, and only linear (or a DRM
     * modifier the display's plane lists) qualifies. */
-   if (image->wsi_scanout || image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
+   if (image->wsi_scanout || image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT ||
+       mali_format_is_ycbcr(image->vk.format))
       return DRM_FORMAT_MOD_LINEAR;
    if (!(image->vk.external_handle_types & MALI_EXTERNAL_FD_TYPES) &&
        (arch == 7 ? v7_can_use_afbc(image, formats, info) : can_use_afbc(image, formats, arch)))
@@ -305,6 +306,16 @@ image_init_layout(struct mali_device *dev, struct mali_image *image,
       VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID);
    const bool fd = external && (external->handleTypes & MALI_EXTERNAL_FD_TYPES);
    const bool drm = pCreateInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+   const bool yuv = mali_format_is_ycbcr(image->vk.format);
+   const bool external_yuv = yuv && image->android_external_format && image->ahb;
+   if (yuv &&
+       (!mali_ycbcr_enabled(pdev->arch) || fd || drm || (image->ahb && !external_yuv) || wsi_scanout ||
+        pCreateInfo->imageType != VK_IMAGE_TYPE_2D || pCreateInfo->mipLevels != 1 ||
+        pCreateInfo->arrayLayers != 1 || pCreateInfo->samples != VK_SAMPLE_COUNT_1_BIT ||
+        (pCreateInfo->usage & ~MALI_YCBCR_IMAGE_USAGES) ||
+        ((pCreateInfo->usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT) && !mali_host_copy_enabled(pdev->arch)) ||
+        (pCreateInfo->flags & ~MALI_YCBCR_IMAGE_FLAGS)))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
    if ((fd || drm) && (pCreateInfo->imageType != VK_IMAGE_TYPE_2D || pCreateInfo->extent.depth != 1 ||
        pCreateInfo->mipLevels != 1 || pCreateInfo->arrayLayers != 1 || pCreateInfo->samples != 1 ||
        !mali_fd_image_format_supported(pCreateInfo->format) ||
@@ -347,14 +358,14 @@ image_init_layout(struct mali_device *dev, struct mali_image *image,
    }
    if (image->ahb && (!mali_android_buffer_available() ||
        pCreateInfo->extent.depth != 1 ||
-       (pCreateInfo->flags & ~(VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT)) ||
+       (pCreateInfo->flags & ~MALI_AHB_IMAGE_CREATE_FLAGS) ||
        pCreateInfo->sharingMode != VK_SHARING_MODE_EXCLUSIVE ||
        (pCreateInfo->usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) ||
        external->handleTypes != VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID ||
        pCreateInfo->imageType != VK_IMAGE_TYPE_2D ||
        pCreateInfo->mipLevels != 1 || pCreateInfo->arrayLayers != 1 || pCreateInfo->samples != 1 ||
        pCreateInfo->tiling != VK_IMAGE_TILING_OPTIMAL ||
-       !mali_android_hal_format(pCreateInfo->format))) {
+       (!external_yuv && !mali_android_hal_format(pCreateInfo->format)))) {
       result = VK_ERROR_FORMAT_NOT_SUPPORTED; goto fail;
    }
 
@@ -393,7 +404,7 @@ image_init_layout(struct mali_device *dev, struct mali_image *image,
    }
    uint64_t offset = mod_explicit ? mod_explicit->pPlaneLayouts[0].offset : 0;
    for (unsigned p = 0; p < image->plane_count; p++) {
-      const VkExtent3D extent = image->vk.extent;
+      const VkExtent3D extent = mali_image_plane_extent(image, p, 0);
       const struct mali_image_layout_info info = {
          .format = formats[p],
          .modifier = image->vk.drm_format_mod,
@@ -712,6 +723,10 @@ mali_GetImageSubresourceLayout2(VkDevice _device, VkImage _image,
       .arrayPitch = pl->array_stride,
       .depthPitch = s->surface_stride,
    };
+   VkSubresourceHostMemcpySize *copy =
+      vk_find_struct(pLayout->pNext, SUBRESOURCE_HOST_MEMCPY_SIZE);
+   if (copy)
+      copy->size = (image->vk.usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT) ? s->size : 0;
 }
 
 /* maintenance5 building block: use the same normalization and layout as

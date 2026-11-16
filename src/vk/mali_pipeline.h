@@ -44,6 +44,7 @@
 
 #include "mali_arch.h"
 #include "mali_shader.h"
+#include "mali_poly.h"
 
 struct vk_command_buffer;
 
@@ -197,6 +198,12 @@ struct mali_graphics_pipeline {
    struct mali_shader *fs;              /* reference, NULL without a fragment stage */
    struct mali_bo_ref zsd_mem;          /* bind.zsd */
 
+   struct {
+      struct mali_shader *vertex, *main, *count, *pre;
+      struct poly_gs_info gs;
+      uint64_t vertex_outputs;
+   } geometry;
+
    /* Which states are dynamic (MESA_VK_DYNAMIC_*). */
    BITSET_DECLARE(dynamic, MESA_VK_DYNAMIC_GRAPHICS_STATE_ENUM_MAX);
    /* The pipeline's static state, for the bind. */
@@ -240,6 +247,7 @@ mali_compute_pipeline(struct vk_pipeline *p)
 
 /* What mali_gfx_pack_state() packs from. */
 struct mali_gfx_pack_input {
+   const struct poly_gs_info *geometry;
    const struct vk_dynamic_graphics_state *dyn;
    const struct vk_render_pass_state *rp;
    const struct mali_shader *vs;

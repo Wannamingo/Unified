@@ -5,12 +5,14 @@
 #include <stdint.h>
 #include "vulkan/vulkan.h"
 #include "mali_android_rgb_external.h"
+#include "mali_android_yuv.h"
 struct mali_device;
 struct mali_device_memory;
 struct mali_image;
 struct AHardwareBuffer;
 struct native_handle;
 struct mali_android_buffer {
+   struct mali_android_yuv_layout yuv;
    int fd;                       /* borrowed from the registered gralloc handle */
    uint32_t format, width, height, layers, pixel_stride;
    uint64_t usage, allocation_size, modifier, offset, row_stride, layer_stride;

@@ -28,9 +28,26 @@
 struct mali_device_memory;
 struct mali_physical_device;
 
-/* Depth and stencil of a combined format live in two planes (as panvk and
- * the blob do). Multi-planar YUV is not supported. */
-#define MALI_IMAGE_MAX_PLANES 2
+/* Depth and stencil, as well as converted YCbCr, use separate planes. */
+#define MALI_IMAGE_MAX_PLANES 3
+
+#define MALI_YCBCR_IMAGE_USAGES (VK_IMAGE_USAGE_SAMPLED_BIT | \
+                               VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | \
+                               VK_IMAGE_USAGE_HOST_TRANSFER_BIT)
+#define MALI_YCBCR_IMAGE_FLAGS (VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_ALIAS_BIT)
+
+static inline bool
+mali_format_is_ycbcr(VkFormat format)
+{
+   return format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM ||
+          format == VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM;
+}
+
+bool mali_ycbcr_enabled(uint32_t arch);
+
+#define MALI_HOST_COPY_LAYOUT_COUNT 5
+extern VkImageLayout mali_host_copy_layouts[MALI_HOST_COPY_LAYOUT_COUNT];
+bool mali_host_copy_enabled(uint32_t arch);
 
 /* log2(16384) + 1: maxImageDimension* is 16384. */
 #define MALI_IMAGE_MAX_LEVELS 15
@@ -233,7 +250,48 @@ mali_image_aspect_plane(const struct mali_image *image, VkImageAspectFlags aspec
 {
    if (aspect == VK_IMAGE_ASPECT_STENCIL_BIT)
       return image->plane_count - 1;
+   if (aspect == VK_IMAGE_ASPECT_PLANE_1_BIT)
+      return 1;
+   if (aspect == VK_IMAGE_ASPECT_PLANE_2_BIT)
+      return 2;
    return 0;
+}
+
+static inline VkExtent3D
+mali_image_plane_extent(const struct mali_image *image, unsigned plane, unsigned level)
+{
+   VkExtent3D extent = vk_image_mip_level_extent(&image->vk, level);
+   if (plane && mali_format_is_ycbcr(image->vk.format)) {
+      extent.width = (extent.width + 1) / 2;
+      extent.height = (extent.height + 1) / 2;
+   }
+   return extent;
+}
+
+/* The color aspect of a multiplanar copy is in luma coordinates. */
+static inline unsigned
+mali_image_copy_plane_count(const struct mali_image *src, const VkImageCopy2 *region)
+{
+   return mali_format_is_ycbcr(src->vk.format) &&
+          region->srcSubresource.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT ?
+          src->plane_count : 1;
+}
+
+static inline VkImageCopy2
+mali_image_copy_plane(const VkImageCopy2 *region, unsigned plane)
+{
+   VkImageCopy2 r = *region;
+   r.srcSubresource.aspectMask = VK_IMAGE_ASPECT_PLANE_0_BIT << plane;
+   r.dstSubresource.aspectMask = r.srcSubresource.aspectMask;
+   if (plane) {
+      r.srcOffset.x /= 2;
+      r.srcOffset.y /= 2;
+      r.dstOffset.x /= 2;
+      r.dstOffset.y /= 2;
+      r.extent.width = (r.extent.width + 1) / 2;
+      r.extent.height = (r.extent.height + 1) / 2;
+   }
+   return r;
 }
 
 /*
@@ -243,6 +301,8 @@ mali_image_aspect_plane(const struct mali_image *image, VkImageAspectFlags aspec
  */
 struct mali_image_view {
    struct vk_image_view vk;
+   uint32_t tex_planes[MALI_IMAGE_MAX_PLANES - 1][8];
+   uint8_t tex_plane_count;
 
    /* Texture descriptor for sampled images, input attachments and the
     * image half of combined image/samplers (views with SAMPLED or

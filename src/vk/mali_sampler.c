@@ -20,11 +20,13 @@
 #include "mali_vk.h"
 #include "mali_arch.h"
 #include "mali_descriptor_set.h"
+#include "mali_image.h"
 
 #include "genxml/gen_macros.h"
 
 #include "vk_log.h"
 #include "vk_sampler.h"
+#include "vk_ycbcr_conversion.h"
 
 static enum mali_mipmap_mode
 mipmap_mode(VkSamplerMipmapMode mode, bool aniso)
@@ -147,7 +149,9 @@ MALI_PER_ARCH(CreateSampler)(VkDevice _device, const VkSamplerCreateInfo *pCreat
    if (!sampler)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   if (sampler->vk.ycbcr_conversion) {
+   if (sampler->vk.ycbcr_conversion &&
+       !(mali_ycbcr_enabled(mali_device_physical(dev)->arch) &&
+         mali_format_is_ycbcr(sampler->vk.ycbcr_conversion->state.format))) {
       vk_sampler_destroy(&dev->vk, pAllocator, &sampler->vk);
       return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
                        "samplers with a YCbCr conversion are not supported");

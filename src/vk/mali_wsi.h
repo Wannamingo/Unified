@@ -23,6 +23,12 @@ struct mali_image;
 struct mali_physical_device;
 struct mali_queue;
 
+/* Supported flags for a typed AHB image. ALIAS leaves the dedicated
+ * allocation and layout requirements in force. */
+#define MALI_AHB_IMAGE_CREATE_FLAGS \
+   (VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT | \
+    VK_IMAGE_CREATE_ALIAS_BIT)
+
 /* gralloc usage bits (hardware/gralloc.h, gralloc1.h; the 64-bit gralloc 4
  * BufferUsage has the same values). */
 #define MALI_GRALLOC_USAGE_HW_TEXTURE 0x100ull  /* GPU_TEXTURE (consumer) */

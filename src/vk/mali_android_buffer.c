@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /* Android 13/14 gralloc4 bridge. The public libnativewindow dependency
  * supplies the system mapper. No handle offsets or vendor fd indices are used.
- * Only single-plane linear typed images and BLOB buffers are admitted.
+ * Supports linear RGB, BLOB and opt-in linear YUV AHardwareBuffers.
  *
  * The mapper's C++ entrypoints are resolved by their exact ABI names. Its AIDL
  * PlaneLayout is components + eight int64_t fields (AOSP graphics/common AIDL).
@@ -57,6 +57,7 @@ static struct {
    int (*height)(void *, const native_handle_t *, uint64_t *);
    int (*layers)(void *, const native_handle_t *, uint64_t *);
    int (*format)(void *, const native_handle_t *, uint32_t *);
+   int (*string_compare)(const void *, const char *);
    void (*string_destroy)(void *);
    void (*deallocate)(void *);
    const native_handle_t *(*handle)(const AHardwareBuffer *);
@@ -93,6 +94,8 @@ android_init(void)
    LOAD(layers, "_ZN7android19GraphicBufferMapper13getLayerCountEPK13native_handlePm");
    LOAD(format, "_ZN7android19GraphicBufferMapper23getPixelFormatRequestedEPK13native_handlePNS_8hardware8graphics6common4V1_211PixelFormatE");
    LOAD(string_destroy, "_ZNSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEED1Ev");
+   *(void **)(&android.string_compare) = dlsym(android.lib,
+      "_ZNKSt3__112basic_stringIcNS_11char_traitsIcEENS_9allocatorIcEEE7compareEPKc");
    LOAD(deallocate, "_ZdlPv");
    LOAD(handle, "AHardwareBuffer_getNativeHandle");
    LOAD(describe, "AHardwareBuffer_describe");
@@ -161,6 +164,52 @@ static void destroy_planes(struct platform_vector *v)
    android.deallocate(v->begin);
 }
 
+static bool
+android_yuv_metadata(const struct platform_vector *vector,
+                     struct mali_android_buffer *info)
+{
+   if (!debug_get_bool_option("UNIFIED_YUV", false) ||
+       android.native_only || !android.string_compare ||
+       (info->format != 0x23 && info->format != 0x11 && info->format != 0x32315659))
+      return false;
+   const uintptr_t begin = (uintptr_t)vector->begin, end = (uintptr_t)vector->end;
+   if (end < begin || (end - begin) % sizeof(struct platform_plane)) return false;
+   const unsigned count = (end - begin) / sizeof(struct platform_plane);
+   if (count != 2 && count != 3) return false;
+   struct mali_android_yuv_plane planes[3] = {0};
+   for (unsigned p = 0; p < count; p++) {
+      const struct platform_plane *src = (const struct platform_plane *)vector->begin + p;
+      const uintptr_t cb = (uintptr_t)src->components.begin, ce = (uintptr_t)src->components.end;
+      if (ce < cb || (ce - cb) % sizeof(struct platform_component)) return false;
+      unsigned components = (ce - cb) / sizeof(struct platform_component);
+      if (components < 1 || components > 2 || src->offset < 0 || src->stride <= 0 ||
+          src->size <= 0 || src->width <= 0 || src->height <= 0 || src->hsub <= 0 ||
+          src->vsub <= 0 || src->increment <= 0 || src->width > UINT32_MAX ||
+          src->height > UINT32_MAX || src->hsub > UINT32_MAX || src->vsub > UINT32_MAX ||
+          src->increment > UINT32_MAX)
+         return false;
+      planes[p] = (struct mali_android_yuv_plane){
+         .offset = src->offset, .row_stride = src->stride, .size = src->size,
+         .width = src->width, .height = src->height, .hsub = src->hsub, .vsub = src->vsub,
+         .increment_bits = src->increment, .component_count = components,
+      };
+      for (unsigned c = 0; c < components; c++) {
+         const struct platform_component *comp = (const struct platform_component *)src->components.begin + c;
+         if (android.string_compare(comp->name,
+                "android.hardware.graphics.common.PlaneLayoutComponentType") ||
+             (comp->type != 1 && comp->type != 2 && comp->type != 4) ||
+             comp->offset < 0 || comp->offset > UINT32_MAX ||
+             comp->size < 0 || comp->size > UINT32_MAX)
+            return false;
+         planes[p].components[c] = (struct mali_android_yuv_component){
+            comp->type, comp->offset, comp->size,
+         };
+      }
+   }
+   return mali_android_yuv_layout_parse(info->width, info->height, info->allocation_size,
+                                        count, planes, &info->yuv);
+}
+
 VkResult mali_android_buffer_info(const native_handle_t *handle,
                                   struct mali_android_buffer *out)
 {
@@ -199,13 +248,18 @@ VkResult mali_android_buffer_info(const native_handle_t *handle,
          return VK_ERROR_INVALID_EXTERNAL_HANDLE;
       *out = info; return VK_SUCCESS;
    }
-   if (mali_android_vk_format(info.format) == VK_FORMAT_UNDEFINED ||
+   const bool yuv = info.format == AHARDWAREBUFFER_FORMAT_Y8Cb8Cr8_420 ||
+                    info.format == 0x11 || info.format == 0x32315659;
+   if ((!yuv && mali_android_vk_format(info.format) == VK_FORMAT_UNDEFINED) ||
        android.modifier(android.mapper, handle, &info.modifier) || info.modifier != DRM_FORMAT_MOD_LINEAR)
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    struct platform_vector planes = {0};
    int err = android.planes(android.mapper, handle, &planes);
    VkResult result = VK_ERROR_INVALID_EXTERNAL_HANDLE;
-   if (!err && (char *)planes.end - (char *)planes.begin == sizeof(struct platform_plane)) {
+   if (!err && yuv && android_yuv_metadata(&planes, &info)) {
+      *out = info;
+      result = VK_SUCCESS;
+   } else if (!err && !yuv && (char *)planes.end - (char *)planes.begin == sizeof(struct platform_plane)) {
       const struct platform_plane *p = planes.begin;
       if (p->offset >= 0 && p->stride > 0 && p->size > 0 && p->increment > 0 && !(p->increment % 8) &&
           p->width > 0 && p->height > 0 &&
@@ -239,6 +293,39 @@ VkResult mali_android_ahb_info(const AHardwareBuffer *buffer, struct mali_androi
 
 VkResult mali_android_image_layout(struct mali_image *image, const struct mali_android_buffer *info)
 {
+   if (info->yuv.plane_count) {
+      const struct vk_image *vi = &image->vk;
+      if (!debug_get_bool_option("UNIFIED_YUV", false) ||
+          vi->format != info->yuv.format || image->plane_count != info->yuv.plane_count ||
+          vi->image_type != VK_IMAGE_TYPE_2D || vi->mip_levels != 1 || vi->array_layers != 1 ||
+          vi->samples != 1 || vi->extent.width != info->width || vi->extent.height != info->height ||
+          (image->android_external_format ?
+             image->android_external_format != mali_android_yuv_token(&info->yuv) :
+             info->yuv.swap_chroma))
+         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+      struct mali_image_plane_layout layouts[MALI_IMAGE_MAX_PLANES];
+      for (unsigned p = 0; p < image->plane_count; p++) {
+         const struct mali_android_yuv_plane *plane = &info->yuv.planes[p];
+         VkExtent3D extent = mali_image_plane_extent(image, p, 0);
+         const struct mali_image_layout_info li = {
+            .format = image->planes[p].format, .modifier = DRM_FORMAT_MOD_LINEAR,
+            .width = extent.width, .height = extent.height, .depth = 1,
+            .samples = 1, .levels = 1, .layers = 1,
+            .explicit_row_stride = plane->row_stride,
+         };
+         if (!mali_image_plane_layout_init(&li, 0, &layouts[p]))
+            return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+         layouts[p].slices[0].offset = plane->offset;
+         layouts[p].slices[0].row_stride = plane->row_stride;
+         layouts[p].slices[0].surface_stride = layouts[p].slices[0].size = plane->size;
+         layouts[p].array_stride = plane->size; layouts[p].data_size = plane->size;
+      }
+      for (unsigned p = 0; p < image->plane_count; p++) image->planes[p].layout = layouts[p];
+      image->size = info->allocation_size;
+      image->vk.drm_format_mod = DRM_FORMAT_MOD_LINEAR;
+      image->crc_header = 0;
+      return VK_SUCCESS;
+   }
    const VkFormat fmt = mali_android_vk_format(info->format);
    const struct vk_image *vi = &image->vk;
    if (fmt == VK_FORMAT_UNDEFINED || image->plane_count != 1 || vi->image_type != VK_IMAGE_TYPE_2D ||
@@ -278,6 +365,9 @@ mali_android_external_image_info(struct mali_device *dev,
    const VkExternalMemoryImageCreateInfo *mem =
       vk_find_struct_const(in->pNext, EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
    VkFormat format = mali_android_rgb_token_format(ext->externalFormat, NULL);
+   if (format == VK_FORMAT_UNDEFINED && android.string_compare &&
+       mali_ycbcr_enabled(mali_device_physical(dev)->arch))
+      format = mali_android_yuv_token_format(ext->externalFormat, NULL);
    if (!mali_android_buffer_available() || !mem ||
        mem->handleTypes != VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID ||
        format == VK_FORMAT_UNDEFINED || in->format != VK_FORMAT_UNDEFINED ||
@@ -307,11 +397,17 @@ mali_CreateSamplerYcbcrConversion(VkDevice device,
    const VkExternalFormatANDROID *external = vk_find_struct_const(info->pNext, EXTERNAL_FORMAT_ANDROID);
    if (!external || !external->externalFormat)
       return vk_common_CreateSamplerYcbcrConversion(device, info, alloc, out);
-   if (info->ycbcrModel != VK_SAMPLER_YCBCR_MODEL_CONVERSION_RGB_IDENTITY ||
-       info->forceExplicitReconstruction)
-      return VK_ERROR_FORMAT_NOT_SUPPORTED;
    bool swap = false;
    VkFormat format = mali_android_rgb_token_format(external->externalFormat, &swap);
+   bool yuv = false;
+   if (format == VK_FORMAT_UNDEFINED && android.string_compare &&
+       mali_ycbcr_enabled(mali_device_physical(dev)->arch)) {
+      format = mali_android_yuv_token_format(external->externalFormat, &swap);
+      yuv = mali_format_is_ycbcr(format);
+   }
+   if ((!yuv && info->ycbcrModel != VK_SAMPLER_YCBCR_MODEL_CONVERSION_RGB_IDENTITY) ||
+       info->forceExplicitReconstruction)
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
    if (!mali_android_buffer_available() ||
        info->format != VK_FORMAT_UNDEFINED || format == VK_FORMAT_UNDEFINED ||
        !(mali_format_image_features(mali_device_physical(dev), format) & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT))
@@ -475,12 +571,15 @@ mali_GetAndroidHardwareBufferPropertiesANDROID(VkDevice device, const AHardwareB
    struct mali_android_buffer info;
    VkResult r = mali_android_ahb_info(buffer, &info);
    if (r != VK_SUCCESS) return r;
+   const bool yuv = info.yuv.plane_count != 0;
+   if (yuv && !mali_ycbcr_enabled(mali_device_physical(dev)->arch))
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    props->allocationSize=info.allocation_size;
    props->memoryTypeBits=1u << MALI_MEMORY_TYPE_EXTERNAL_CACHED;
    vk_foreach_struct(stype,ext,props->pNext) {
-      VkFormat format=mali_android_vk_format(info.format);
+      VkFormat format = yuv ? info.yuv.format : mali_android_vk_format(info.format);
       VkFormatFeatureFlags features=format==VK_FORMAT_UNDEFINED?0:mali_format_image_features(mali_device_physical(dev),format);
-      const uint64_t external_format = mali_android_rgb_token(format);
+      const uint64_t external_format = yuv ? mali_android_yuv_token(&info.yuv) : mali_android_rgb_token(format);
       VkFormatFeatureFlags external_features = 0;
       if (external_format) {
          external_features = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
@@ -490,20 +589,21 @@ mali_GetAndroidHardwareBufferPropertiesANDROID(VkDevice device, const AHardwareB
             external_features |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
                VK_FORMAT_FEATURE_SAMPLED_IMAGE_YCBCR_CONVERSION_LINEAR_FILTER_BIT;
       }
+      if (yuv) external_features = features;
       if (stype==VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_2_ANDROID) {
          VkAndroidHardwareBufferFormatProperties2ANDROID *p=ext;
-         p->format=format;p->externalFormat=external_format;p->formatFeatures=external_features;
+         p->format=yuv ? VK_FORMAT_UNDEFINED : format;p->externalFormat=external_format;p->formatFeatures=external_features;
          p->samplerYcbcrConversionComponents=(VkComponentMapping){0,0,0,0};
-         p->suggestedYcbcrModel=VK_SAMPLER_YCBCR_MODEL_CONVERSION_RGB_IDENTITY;
-         p->suggestedYcbcrRange=VK_SAMPLER_YCBCR_RANGE_ITU_FULL;
+         p->suggestedYcbcrModel=yuv ? VK_SAMPLER_YCBCR_MODEL_CONVERSION_YCBCR_601 : VK_SAMPLER_YCBCR_MODEL_CONVERSION_RGB_IDENTITY;
+         p->suggestedYcbcrRange=yuv ? VK_SAMPLER_YCBCR_RANGE_ITU_NARROW : VK_SAMPLER_YCBCR_RANGE_ITU_FULL;
          p->suggestedXChromaOffset=p->suggestedYChromaOffset=VK_CHROMA_LOCATION_COSITED_EVEN;
       }
       if (stype==VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID) {
          VkAndroidHardwareBufferFormatPropertiesANDROID *p=ext;
-         p->format=format;p->externalFormat=external_format;p->formatFeatures=external_features;
+         p->format=yuv ? VK_FORMAT_UNDEFINED : format;p->externalFormat=external_format;p->formatFeatures=external_features;
          p->samplerYcbcrConversionComponents=(VkComponentMapping){0,0,0,0};
-         p->suggestedYcbcrModel=VK_SAMPLER_YCBCR_MODEL_CONVERSION_RGB_IDENTITY;
-         p->suggestedYcbcrRange=VK_SAMPLER_YCBCR_RANGE_ITU_FULL;
+         p->suggestedYcbcrModel=yuv ? VK_SAMPLER_YCBCR_MODEL_CONVERSION_YCBCR_601 : VK_SAMPLER_YCBCR_MODEL_CONVERSION_RGB_IDENTITY;
+         p->suggestedYcbcrRange=yuv ? VK_SAMPLER_YCBCR_RANGE_ITU_NARROW : VK_SAMPLER_YCBCR_RANGE_ITU_FULL;
          p->suggestedXChromaOffset=p->suggestedYChromaOffset=VK_CHROMA_LOCATION_COSITED_EVEN;
       }
    }

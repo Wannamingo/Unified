@@ -3,7 +3,7 @@
 The driver retains the original ARMSX2 and bmdhacks MIT license and its source-file notices.
 The current driver lineage starts from [the upstream 0.4.0 release](https://github.com/bmdhacks/malisx2/releases/tag/v0.4.0).
 
-Mesa sources are fetched from [the pinned revision](https://github.com/bmdhacks/armsx2-turnip/tree/45ff8fac44d9132118d0dddd2ff49f5d827533fb) and built with the [format patch](patches/mesa-0.4.57.patch).
+Mesa sources are fetched from [the pinned revision](https://github.com/bmdhacks/armsx2-turnip/tree/45ff8fac44d9132118d0dddd2ff49f5d827533fb) and built with the [Mesa patch](patches/mesa-0.4.61.patch).
 Their original license identifiers remain in the upstream files. The complete `licenses/` directory is copied into the Android distribution.
 
 The Rust dependencies are pinned by `subprojects/*.wrap`, with versions and original license notices included in the Android distribution.

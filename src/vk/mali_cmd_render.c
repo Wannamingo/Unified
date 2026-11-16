@@ -16,8 +16,7 @@
  * panvk differ and both are valid, the blob's choice is taken when it is
  * simpler or is what this kernel was tested with:
  *
- *  - no tiler out-of-memory exception handler and no incremental
- *    rendering (the queue group has none);
+ *  - optional incremental rendering via a CSF tiler OOM handler;
  *  - the tiler heap and geometry buffer belong to the queue; the device
  *    has one queue, so a ONE_TIME_SUBMIT command buffer gets them packed
  *    into its tiler contexts on the CPU, and any other command buffer
@@ -295,6 +294,8 @@ MALI_PER_ARCH(cmd_render_tiler)(struct mali_cmd_buffer *cmd)
    r->td_count = td_count;
 
    struct cs_builder *b = mali_cmd_cs(cmd, MALI_SUBQUEUE_VERTEX_TILER);
+   if (cmd->dev->csf->tiler_ir && !mali_tiler_ir_arm(cmd, r))
+      return false;
    if (!once) {
       struct cs_index zero_lo = mali_cs_scratch_reg_tuple(b, 0, 2);
       struct cs_index heap_geom = mali_cs_scratch_reg_tuple(b, 2, 4);
@@ -524,7 +525,10 @@ issue_fragment_jobs(struct mali_cmd_buffer *cmd, struct mali_render_state *r,
                                            MALI_SUBQUEUE_FRAGMENT, cmd->passes - 1);
 
    struct cs_index fbd = cs_sr_reg64(b, FRAGMENT, FBD_POINTER);
-   cs_move64_to(b, fbd, fbd_ptr);
+   if (r->ir_arm)
+      mali_tiler_ir_finish(cmd, r, fbd_ptr);
+   else
+      cs_move64_to(b, fbd, fbd_ptr);
    const uint32_t layers = MAX2(r->desc.layer_count, 1);
    for (uint32_t l = 0; l < layers; l++) {
       if (l)
@@ -582,7 +586,10 @@ MALI_PER_ARCH(cmd_render_end)(struct mali_cmd_buffer *cmd)
    if (MALI_PER_ARCH(fb_pass_has_work)(r) && !vk_command_buffer_has_error(&cmd->vk)) {
       bool ok = mali_fb_alloc_tsd(cmd, r);
       uint32_t fbd_sz = 0;
+      r->ir_descriptors = r->ir_arm && mali_tiler_ir_eligible(r);
       uint64_t fbds = ok ? MALI_PER_ARCH(fb_build)(cmd, r, &fbd_sz) : 0;
+      if (fbds && r->ir_descriptors && !mali_tiler_ir_prepare(cmd, r, fbd_sz))
+         fbds = 0;
       if (!fbds) {
          vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       } else {

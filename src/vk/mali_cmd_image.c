@@ -528,51 +528,60 @@ MALI_PER_ARCH(CmdCopyImage2)(VkCommandBuffer commandBuffer, const VkCopyImageInf
    }
 
    for (uint32_t i = 0; i < info->regionCount; i++) {
-      const VkImageCopy2 *r = &info->pRegions[i];
-      u_foreach_bit(a, r->srcSubresource.aspectMask) {
-         const VkImageAspectFlags aspect = BITFIELD_BIT(a);
-         /* Multi-aspect copies pair the aspects in order. */
-         const VkImageAspectFlags daspect =
-            r->dstSubresource.aspectMask == r->srcSubresource.aspectMask ?
-               aspect : r->dstSubresource.aspectMask;
-         const bool src3d = src->vk.image_type == VK_IMAGE_TYPE_3D;
-         const bool dst3d = dst->vk.image_type == VK_IMAGE_TYPE_3D;
-         struct copy_surface s, d;
-         image_surface(src, aspect, r->srcSubresource.mipLevel,
-                       src3d ? r->srcOffset.z : r->srcSubresource.baseArrayLayer, &s);
-         image_surface(dst, daspect, r->dstSubresource.mipLevel,
-                       dst3d ? r->dstOffset.z : r->dstSubresource.baseArrayLayer, &d);
-         const uint32_t layers = subresource_layers(&src->vk, &r->srcSubresource, &r->extent);
-         /* The extent is in source texels; both sides count blocks of the
-          * same size (size-compatible formats). */
-         const int sx = r->srcOffset.x / s.block_w, sy = r->srcOffset.y / s.block_h;
-         const int dx = r->dstOffset.x / d.block_w, dy = r->dstOffset.y / d.block_h;
-         const uint32_t w = DIV_ROUND_UP(r->extent.width, s.block_w);
-         const uint32_t h = DIV_ROUND_UP(r->extent.height, s.block_h);
-         const unsigned splane = aspect_plane(src, aspect);
-         const unsigned dplane = aspect_plane(dst, daspect);
-         if (mali_image_is_afbc(dst) || (src->vk.samples == 1 && copy_on_fragment(cmd, src, dst, aspect, &s))) {
-            const struct copy_src cs = {
-               .img = mali_image_is_afbc(src) ? src : NULL,
-               .plane = splane,
-               .level = r->srcSubresource.mipLevel,
-               .layer = r->srcSubresource.baseArrayLayer,
-               .raw = s,
-               .x = sx,
-               .y = sy,
-            };
-            copy_to_afbc(cmd, dst, dplane, r->dstSubresource.mipLevel,
-                         r->dstSubresource.baseArrayLayer, dx, dy, w, h, layers, &cs);
-         } else if (mali_image_is_afbc(src)) {
-            copy_from_afbc(cmd, src, splane, r->srcSubresource.mipLevel,
-                           r->srcSubresource.baseArrayLayer, sx, sy, &d, dx, dy, w, h,
-                           layers);
-         } else {
-            for (unsigned sample = 0; sample < src->vk.samples; sample++) {
-               struct copy_surface ss = s, dd = d;
-               ss.base += sample * src->planes[splane].layout.slices[r->srcSubresource.mipLevel].surface_stride;
-               dd.base += sample * dst->planes[dplane].layout.slices[r->dstSubresource.mipLevel].surface_stride;
-               dispatch_copy(cmd, &ss, sx, sy, &dd, dx, dy, w, h, layers);
+      const VkImageCopy2 *region = &info->pRegions[i];
+      const unsigned num_planes = mali_image_copy_plane_count(src, region);
+      for (unsigned plane = 0; plane < num_planes; ++plane) {
+         VkImageCopy2 plane_region;
+         const VkImageCopy2 *r = region;
+         if (num_planes > 1) {
+            plane_region = mali_image_copy_plane(region, plane);
+            r = &plane_region;
+         }
+         u_foreach_bit(a, r->srcSubresource.aspectMask) {
+            const VkImageAspectFlags aspect = BITFIELD_BIT(a);
+            /* Multi-aspect copies pair the aspects in order. */
+            const VkImageAspectFlags daspect =
+               r->dstSubresource.aspectMask == r->srcSubresource.aspectMask ?
+                  aspect : r->dstSubresource.aspectMask;
+            const bool src3d = src->vk.image_type == VK_IMAGE_TYPE_3D;
+            const bool dst3d = dst->vk.image_type == VK_IMAGE_TYPE_3D;
+            struct copy_surface s, d;
+            image_surface(src, aspect, r->srcSubresource.mipLevel,
+                          src3d ? r->srcOffset.z : r->srcSubresource.baseArrayLayer, &s);
+            image_surface(dst, daspect, r->dstSubresource.mipLevel,
+                          dst3d ? r->dstOffset.z : r->dstSubresource.baseArrayLayer, &d);
+            const uint32_t layers = subresource_layers(&src->vk, &r->srcSubresource, &r->extent);
+            /* The extent is in source texels; both sides count blocks of the
+             * same size (size-compatible formats). */
+            const int sx = r->srcOffset.x / s.block_w, sy = r->srcOffset.y / s.block_h;
+            const int dx = r->dstOffset.x / d.block_w, dy = r->dstOffset.y / d.block_h;
+            const uint32_t w = DIV_ROUND_UP(r->extent.width, s.block_w);
+            const uint32_t h = DIV_ROUND_UP(r->extent.height, s.block_h);
+            const unsigned splane = aspect_plane(src, aspect);
+            const unsigned dplane = aspect_plane(dst, daspect);
+            if (mali_image_is_afbc(dst) || (src->vk.samples == 1 && copy_on_fragment(cmd, src, dst, aspect, &s))) {
+               const struct copy_src cs = {
+                  .img = mali_image_is_afbc(src) ? src : NULL,
+                  .plane = splane,
+                  .level = r->srcSubresource.mipLevel,
+                  .layer = r->srcSubresource.baseArrayLayer,
+                  .raw = s,
+                  .x = sx,
+                  .y = sy,
+               };
+               copy_to_afbc(cmd, dst, dplane, r->dstSubresource.mipLevel,
+                            r->dstSubresource.baseArrayLayer, dx, dy, w, h, layers, &cs);
+            } else if (mali_image_is_afbc(src)) {
+               copy_from_afbc(cmd, src, splane, r->srcSubresource.mipLevel,
+                              r->srcSubresource.baseArrayLayer, sx, sy, &d, dx, dy, w, h,
+                              layers);
+            } else {
+               for (unsigned sample = 0; sample < src->vk.samples; sample++) {
+                  struct copy_surface ss = s, dd = d;
+                  ss.base += sample * src->planes[splane].layout.slices[r->srcSubresource.mipLevel].surface_stride;
+                  dd.base += sample * dst->planes[dplane].layout.slices[r->dstSubresource.mipLevel].surface_stride;
+                  dispatch_copy(cmd, &ss, sx, sy, &dd, dx, dy, w, h, layers);
+               }
             }
          }
       }

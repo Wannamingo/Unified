@@ -75,6 +75,7 @@ struct mali_common_sysvals_inner {
    mali_aligned_u64 push_uniforms;
    mali_aligned_u64 printf_buffer_address;
    mali_aligned_u64 constant_data;
+   mali_aligned_u64 poly_params;
 } __attribute__((aligned(8)));
 
 struct mali_input_attachment_info {
@@ -494,6 +495,7 @@ MALI_PER_ARCH_DECL(struct spirv_to_nir_options, shader_spirv_options,
                    (const struct vk_pipeline_robustness_state *rs));
 
 struct mali_shader_compile_info {
+   bool poly_vertex_inputs;
    /* Consumed (freed) by mali_shader_compile whatever the result. */
    nir_shader *nir;
    const struct vk_pipeline_robustness_state *rs;

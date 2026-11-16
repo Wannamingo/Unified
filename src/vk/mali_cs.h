@@ -65,10 +65,11 @@ enum mali_sb {
  *
  * The blob hands out one entry per (source, destination) subqueue pair
  * from 16, starting at 4 (2 and 3 are fixed for its transfer subqueue,
- * 0 and 1 unused). Only the vertex/tiler -> fragment pass dependency
- * uses one here.
+ * 0 and 1 unused). Incremental rendering reserves a reverse dependency
+ * to arm the handler before the corresponding tiling work can start.
  */
 #define MALI_SHARED_SB_VT_TO_FRAG 4
+#define MALI_SHARED_SB_IR_READY 5
 
 static inline void
 mali_cs_shared_sb_inc(struct cs_builder *b, unsigned entry, struct cs_async_op async)
@@ -128,6 +129,18 @@ struct mali_cs_sync64 {
  * from the subqueue's first words on. Render passes add the tiler
  * fields' users; the queue fills them now.
  */
+struct mali_tiler_spill {
+   uint64_t first, middle, scratch, tiler;
+   uint32_t layers, view_mask, td_count;
+   uint32_t counter; /* reset from the command buffer's zero template */
+};
+
+struct mali_tiler_arm {
+   struct mali_tiler_spill spill;
+   uint64_t handler;
+   uint32_t handler_length;
+};
+
 struct mali_cs_subqueue_ctx {
    uint64_t syncobjs;     /* struct mali_cs_sync64[MALI_SUBQUEUE_COUNT]:
                              barrier counters, one per subqueue */
@@ -137,6 +150,9 @@ struct mali_cs_subqueue_ctx {
    uint64_t geom_buf;     /* geometry buffer, size code in the low bits */
    uint32_t last_error;
    uint32_t pad[7];
+   uint64_t ir_dump;      /* backing store for CS function registers */
+   struct mali_tiler_spill spill;
+   uint32_t ir_calls;
 } __attribute__((aligned(64)));
 
 /* Scoreboard facts of the device's CS interface. */

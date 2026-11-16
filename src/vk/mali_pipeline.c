@@ -80,6 +80,10 @@ graphics_pipeline_destroy(struct vk_device *vk_dev, struct vk_pipeline *vk_pipel
    struct mali_graphics_pipeline *p = mali_graphics_pipeline(vk_pipeline);
 
    MALI_PER_ARCH(shader_unref)(dev, p->vs);
+   MALI_PER_ARCH(shader_unref)(dev, p->geometry.vertex);
+   MALI_PER_ARCH(shader_unref)(dev, p->geometry.main);
+   MALI_PER_ARCH(shader_unref)(dev, p->geometry.count);
+   MALI_PER_ARCH(shader_unref)(dev, p->geometry.pre);
    MALI_PER_ARCH(shader_unref)(dev, p->fs);
    if (p->zsd_mem.size)
       mali_bo_pool_free(&dev->desc_pool, &p->zsd_mem);
@@ -259,7 +263,8 @@ stage_to_nir(struct mali_device *dev, VkPipelineCreateFlags2KHR flags, struct st
                        "the %s stage's SPIR-V was rejected by the SPIR-V front end",
                        mesa_shader_stage_name(stage));
 
-   MALI_PER_ARCH(shader_preprocess)(dev, st->nir);
+   if (stage != MESA_SHADER_GEOMETRY)
+      MALI_PER_ARCH(shader_preprocess)(dev, st->nir);
    return VK_SUCCESS;
 }
 
@@ -771,6 +776,30 @@ clip_fs_compile(struct mali_device *dev, struct vk_pipeline_cache *cache,
 #endif /* PAN_ARCH != 9 */
 
 static VkResult
+poly_compile(struct mali_device *dev, nir_shader *nir, struct stage *stage,
+             const struct vk_pipeline_layout *layout,
+             const struct vk_graphics_pipeline_state *state, bool vertex_inputs,
+             const char *label, struct mali_shader **out)
+{
+   const unsigned root = MALI_SYSVALS_PUSH_CONST_BASE +
+      offsetof(struct mali_graphics_sysvals, common.poly_params);
+   mali_poly_lower_params(nir, MALI_POLY_INDIRECT_ROOT | root);
+   MALI_PER_ARCH(shader_preprocess)(dev, nir);
+   struct mesa_blake3 h;
+   blake3_hash key;
+   _mesa_blake3_init(&h);
+   _mesa_blake3_update(&h, label, strlen(label));
+   _mesa_blake3_update(&h, stage->stage_hash, sizeof(stage->stage_hash));
+   hash_layout(&h, layout);
+   _mesa_blake3_final(&h, key);
+   const struct mali_shader_compile_info info = {
+      .nir = nir, .rs = &stage->rs, .layout = layout, .state = state,
+      .poly_vertex_inputs = vertex_inputs,
+   };
+   return MALI_PER_ARCH(shader_compile)(dev, &info, key, out);
+}
+
+static VkResult
 create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
                          const VkGraphicsPipelineCreateInfo *ci,
                          const VkAllocationCallbacks *alloc, VkPipeline *out)
@@ -779,8 +808,12 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
    const VkPipelineCreateFlags2KHR flags = vk_graphics_pipeline_create_flags(ci);
    VK_FROM_HANDLE(vk_pipeline_layout, layout, ci->layout);
    struct vk_pipeline_cache *cache = pick_cache(dev, cache_handle);
-   struct stage stages[2];
-   struct stage *vs = NULL, *fs = NULL;
+   struct stage stages[3];
+   struct stage *vs = NULL, *fs = NULL, *gs = NULL;
+   struct mali_shader *poly_vertex = NULL, *poly_main = NULL;
+   struct mali_shader *poly_count = NULL, *poly_pre = NULL;
+   struct poly_gs_info gs_info = {0};
+   uint64_t poly_outputs = 0;
 #if PAN_ARCH != 9
    /* The fragment shader that only clips (clip_fs_compile), if needed. */
    struct stage clip = {0};
@@ -807,6 +840,13 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
          fs = &stages[stage_count++];
          stage_init(dev, flags, ci->pNext, si, fs);
          break;
+      case VK_SHADER_STAGE_GEOMETRY_BIT:
+         if (PAN_ARCH != 11 || !dev->vk.enabled_features.geometryShader)
+            return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
+                             "geometry shader feature was not enabled");
+         gs = &stages[stage_count++];
+         stage_init(dev, flags, ci->pNext, si, gs);
+         break;
       default:
          return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT,
                           "shader stage 0x%x is not supported", si->stage);
@@ -823,61 +863,106 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
    if (result != VK_SUCCESS)
       return result;
 
-   /* Fragment key does not depend on the pruned vertex output mask.
-    * Look it up first: its saved preprocessed mask lets a warm request build
-    * the exact same vertex key without translating SPIR-V again. */
-   struct mesa_blake3 h;
    const uint32_t view_mask = state.mv ? state.mv->view_mask : 0;
-   if (fs) {
-      _mesa_blake3_init(&h);
-      _mesa_blake3_update(&h, "fs", 2);
-      _mesa_blake3_update(&h, fs->stage_hash, sizeof(fs->stage_hash));
-      hash_layout(&h, layout);
-      _mesa_blake3_update(&h, vs->stage_hash, sizeof(vs->stage_hash));
-      hash_fs_state(&h, dev, &state);
-      _mesa_blake3_final(&h, fs->key);
-      stage_lookup(dev, cache, fs);
+   if (!gs) {
+      /* Fragment key does not depend on the pruned vertex output mask.
+       * Look it up first: its saved preprocessed mask lets a warm request build
+       * the exact same vertex key without translating SPIR-V again. */
+      struct mesa_blake3 h;
+      if (fs) {
+         _mesa_blake3_init(&h);
+         _mesa_blake3_update(&h, "fs", 2);
+         _mesa_blake3_update(&h, fs->stage_hash, sizeof(fs->stage_hash));
+         hash_layout(&h, layout);
+         _mesa_blake3_update(&h, vs->stage_hash, sizeof(vs->stage_hash));
+         hash_fs_state(&h, dev, &state);
+         _mesa_blake3_final(&h, fs->key);
+         stage_lookup(dev, cache, fs);
 
-      uint64_t reads;
-      if (fs->shader) {
-         reads = fs->shader->fs.preprocessed_inputs_read;
-      } else {
-         if (flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR) {
-            result = VK_PIPELINE_COMPILE_REQUIRED;
-            goto out;
+         uint64_t reads;
+         if (fs->shader) {
+            reads = fs->shader->fs.preprocessed_inputs_read;
+         } else {
+            if (flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR) {
+               result = VK_PIPELINE_COMPILE_REQUIRED;
+               goto out;
+            }
+            result = stage_to_nir(dev, flags, fs);
+            if (result != VK_SUCCESS)
+               goto out;
+            reads = fs_input_mask(fs->nir);
          }
-         result = stage_to_nir(dev, flags, fs);
-         if (result != VK_SUCCESS)
-            goto out;
-         reads = fs_input_mask(fs->nir);
+         vs->keep_outputs = reads ? reads : ~0ull;
+      } else {
+         vs->keep_outputs = 0;
       }
-      vs->keep_outputs = reads ? reads : ~0ull;
+
+      _mesa_blake3_init(&h);
+      _mesa_blake3_update(&h, "vs", 2);
+      _mesa_blake3_update(&h, vs->stage_hash, sizeof(vs->stage_hash));
+      hash_layout(&h, layout);
+      _mesa_blake3_update(&h, &view_mask, sizeof(view_mask));
+      _mesa_blake3_update(&h, &vs->keep_outputs, sizeof(vs->keep_outputs));
+      _mesa_blake3_final(&h, vs->key);
+      stage_lookup(dev, cache, vs);
+
+      if ((flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR) &&
+          !vs->shader) {
+         result = VK_PIPELINE_COMPILE_REQUIRED;
+         goto out;
+      }
    } else {
-      vs->keep_outputs = 0;
+      if (flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR) {
+         result = VK_PIPELINE_COMPILE_REQUIRED;
+         goto out;
+      }
+      /* Keep this path out of the persistent stage cache: the raster VS
+       * depends on the whole shader chain, not only the original VS key. */
+      result = stage_to_nir(dev, flags, vs);
+      if (result != VK_SUCCESS) goto out;
+      result = stage_to_nir(dev, flags, gs);
+      if (result != VK_SUCCESS) goto out;
+      nir_shader_gather_info(vs->nir, nir_shader_get_entrypoint(vs->nir));
+      poly_outputs = vs->nir->info.outputs_written;
+      if (!mali_poly_lower_vertex(vs->nir)) {
+         result = VK_ERROR_INVALID_SHADER_NV;goto out;
+      }
+      nir_shader *sw = vs->nir;vs->nir = NULL;
+      result = poly_compile(dev, sw, vs, layout, NULL, true, "poly-sw-vs-v1", &poly_vertex);
+      if (result != VK_SUCCESS) goto out;
+      struct mali_poly_geometry lower;
+      nir_shader *input = gs->nir;gs->nir = NULL;
+      if (!mali_poly_lower_geometry(input, &lower)) {
+         mali_poly_geometry_finish(&lower);
+         result = VK_ERROR_INVALID_SHADER_NV;
+         goto out;
+      }
+      gs_info = lower.info;
+      if (gs_info.xfb || gs_info.multistream || gs_info.prefix_sum) {
+         mali_poly_geometry_finish(&lower);
+         result = VK_ERROR_FEATURE_NOT_PRESENT;goto out;
+      }
+#define POLY_COMPILE(field, target, name, state_) do { \
+   if (lower.field) { \
+      nir_shader *nir = lower.field;lower.field = NULL; \
+      result = poly_compile(dev, nir, gs, layout, state_, false, name, target); \
+      if (result != VK_SUCCESS) {mali_poly_geometry_finish(&lower);goto out;} \
+   } \
+} while (0)
+      POLY_COMPILE(main, &poly_main, "poly-gs-main-v1", NULL);
+      POLY_COMPILE(count, &poly_count, "poly-gs-count-v1", NULL);
+      POLY_COMPILE(pre, &poly_pre, "poly-gs-pre-v1", NULL);
+      POLY_COMPILE(raster, &vs->shader, "poly-gs-raster-v1", &state);
+#undef POLY_COMPILE
+      mali_poly_geometry_finish(&lower);
    }
-
-   _mesa_blake3_init(&h);
-   _mesa_blake3_update(&h, "vs", 2);
-   _mesa_blake3_update(&h, vs->stage_hash, sizeof(vs->stage_hash));
-   hash_layout(&h, layout);
-   _mesa_blake3_update(&h, &view_mask, sizeof(view_mask));
-   _mesa_blake3_update(&h, &vs->keep_outputs, sizeof(vs->keep_outputs));
-   _mesa_blake3_final(&h, vs->key);
-   stage_lookup(dev, cache, vs);
-
-   if ((flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR) &&
-       !vs->shader) {
-      result = VK_PIPELINE_COMPILE_REQUIRED;
-      goto out;
-   }
-
    if (!vs->shader) {
       result = stage_compile(dev, cache, flags, vs, layout, &state, NULL);
       if (result != VK_SUCCESS)
          goto out;
    }
    if (fs && !fs->shader) {
-      result = stage_compile(dev, cache, flags, fs, layout, &state,
+      result = stage_compile(dev, gs ? NULL : cache, flags, fs, layout, &state,
                              &vs->shader->info.varyings.formats);
       if (result != VK_SUCCESS)
          goto out;
@@ -908,6 +993,13 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
       goto out;
    }
    p->base.vk.stages = state.shader_stages;
+   p->geometry.vertex = poly_vertex;
+   p->geometry.main = poly_main;
+   p->geometry.count = poly_count;
+   p->geometry.pre = poly_pre;
+   p->geometry.gs = gs_info;
+   p->geometry.vertex_outputs = poly_outputs;
+   poly_vertex = poly_main = poly_count = poly_pre = NULL;
    if (layout)
       p->base.layout = vk_pipeline_layout_ref(layout);
    p->vs = vs->shader;
@@ -934,6 +1026,7 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
 
    p->baked.uses_dynamic_state = baked_words_use_dynamic_state(state.dynamic);
    const struct mali_gfx_pack_input pack = {
+      .geometry = gs ? &p->geometry.gs : NULL,
       .dyn = &p->state,
       .rp = &p->rp,
       .vs = p->vs,
@@ -953,6 +1046,10 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
    result = VK_SUCCESS;
 
 out:
+   MALI_PER_ARCH(shader_unref)(dev, poly_vertex);
+   MALI_PER_ARCH(shader_unref)(dev, poly_main);
+   MALI_PER_ARCH(shader_unref)(dev, poly_count);
+   MALI_PER_ARCH(shader_unref)(dev, poly_pre);
    write_feedback(ci->pNext, stages, stage_count, cache_handle != VK_NULL_HANDLE,
                   os_time_get_nano() - start);
    for (uint32_t i = 0; i < stage_count; i++)

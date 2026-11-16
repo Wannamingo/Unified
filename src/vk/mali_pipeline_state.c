@@ -774,7 +774,8 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
    const uint8_t rt_mask = in->rp->attachments & MESA_VK_RP_ATTACHMENT_ANY_COLOR_BITS;
    bool modifies_coverage = false;
 
-   const enum mesa_prim prim = vk_topology_to_mesa(dyn->ia.primitive_topology);
+   const enum mesa_prim prim = in->geometry ? in->geometry->mode :
+      vk_topology_to_mesa(dyn->ia.primitive_topology);
    const enum mesa_prim reduced = u_reduced_prim(prim);
    bool msaa = dyn->ms.rasterization_samples > 1;
    /* Bresenham lines are rasterized at pixel centres. */
@@ -991,7 +992,8 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
          vk_rasterization_state_depth_clip_enable(rs);
       cfg.secondary_shader = vs->info.vs.secondary_enable && fs != NULL;
 #if PAN_ARCH >= 9
-      cfg.primitive_restart = dyn->ia.primitive_restart_enable;
+      cfg.primitive_restart = in->geometry ? poly_gs_indexed(in->geometry->shape) :
+         dyn->ia.primitive_restart_enable;
 #else
       /* An enum on v7: the implicit restart index of the index type
        * (panvk_emit_tiler_primitive). */
