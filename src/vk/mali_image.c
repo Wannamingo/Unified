@@ -5,9 +5,9 @@
 
 /*
  * VkImage and VkImageView: layout choice, memory requirements, binding,
- * subresource layouts. Render targets and depth buffers are AFBC where
- * every path that touches them can handle it; other images are 16x16
- * u-interleaved unless linear is asked for or tiling cannot help.
+ * subresource layouts. Render targets, depth buffers and eligible sampled
+ * copies are AFBC where every path that touches them can handle it. Other
+ * images are 16x16 u-interleaved unless linear is needed.
  */
 
 #include "mali_vk.h"
@@ -91,12 +91,24 @@ afbc_mode_on_arch(enum mali_afbc_mode mode, unsigned arch)
 }
 
 static bool
-can_use_afbc(const struct mali_image *image, const enum pipe_format *formats, unsigned arch)
+can_use_afbc(const struct mali_image *image, const enum pipe_format *formats,
+             unsigned arch, const VkImageCreateInfo *info)
 {
    const VkImageUsageFlags usage = image->vk.usage | image->vk.stencil_usage;
-   if (!(usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                  VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)))
-      return false;
+   const bool attachment = usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+   if (!attachment) {
+      /* On v11, allow the measured 2x BGRA snapshot to stay in AFBC so
+       * copies into it can use the fragment path. The format and extent
+       * restrict this exception to the image profile tested on G615. */
+      if (arch != 11 ||
+          usage != (VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT) ||
+          image->vk.format != VK_FORMAT_B8G8R8A8_UNORM ||
+          image->vk.extent.width != 1280 || image->vk.extent.height != 960 ||
+          image->plane_count != 1 || image->vk.create_flags ||
+          external_memory(info))
+         return false;
+   }
    if (usage & (VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_HOST_TRANSFER_BIT))
       return false;
    if (image->vk.create_flags & (VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
@@ -203,7 +215,8 @@ choose_modifier(const struct mali_image *image, const enum pipe_format *formats,
        mali_format_is_ycbcr(image->vk.format))
       return DRM_FORMAT_MOD_LINEAR;
    if (!(image->vk.external_handle_types & MALI_EXTERNAL_FD_TYPES) &&
-       (arch == 7 ? v7_can_use_afbc(image, formats, info) : can_use_afbc(image, formats, arch)))
+       (arch == 7 ? v7_can_use_afbc(image, formats, info)
+                  : can_use_afbc(image, formats, arch, info)))
       return mali_afbc_can_ytr(formats[0]) ? MALI_MOD_AFBC_YTR : MALI_MOD_AFBC;
    if (image->vk.tiling == VK_IMAGE_TILING_LINEAR ||
        image->vk.image_type == VK_IMAGE_TYPE_1D ||

@@ -1141,8 +1141,24 @@ static inline bool
 mali_gfx_discards(const struct mali_cmd_buffer *cmd)
 {
    const struct mali_gfx_bind *bd = &cmd->gfx.draw.pipeline->bind;
-   return unlikely(bd->dynamic ? cmd->vk.dynamic_graphics_state.rs.rasterizer_discard_enable
-                               : bd->discard);
+   const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   if (unlikely(bd->dynamic ? dyn->rs.rasterizer_discard_enable : bd->discard))
+      return true;
+
+#if PAN_ARCH == 11
+   /* The packed CSF scissor uses inclusive bounds. An empty Vulkan
+    * rectangle would otherwise rasterize the pixel at equal min/max. */
+   const VkRect2D *sc = &dyn->vp.scissors[0];
+   const VkViewport *vp = &dyn->vp.viewports[0];
+   const float low_y = MIN2(vp->y, vp->y + vp->height);
+   const float high_y = MAX2(vp->y, vp->y + vp->height);
+   return unlikely(!sc->extent.width || !sc->extent.height ||
+                   (double)sc->offset.x + sc->extent.width <= vp->x ||
+                   (double)sc->offset.y + sc->extent.height <= low_y ||
+                   sc->offset.x >= vp->x + vp->width || sc->offset.y >= high_y);
+#else
+   return false;
+#endif
 }
 
 /* Dynamic states this driver reads at draw time, per dirty group. */

@@ -785,6 +785,14 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
    out->prim = prim;
    if (fs) {
       out->rt_written = color_attachment_written_mask(fs, &dyn->cal);
+      /* CSF's DCD masks must match the blend descriptors. In particular,
+       * a depth/occlusion draw may export color with all color writes off. */
+      if (PAN_ARCH == 11) {
+         for (unsigned i = 0; i < MIN2(out->rt_count, MALI_MAX_RTS); i++) {
+            if (out->blend[i].mode == MALI_BLEND_RT_OFF)
+               out->rt_written &= ~BITFIELD_BIT(i);
+         }
+      }
       out->rt_read = color_attachment_read_mask(fs, &dyn->ial, rt_mask);
       modifies_coverage = fs->info.fs.writes_coverage || fs->info.fs.can_discard || a2c;
    }
