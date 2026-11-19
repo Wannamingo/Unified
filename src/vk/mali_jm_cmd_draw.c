@@ -575,6 +575,8 @@ draw_indirect(struct mali_cmd_buffer *cmd, const struct idraw_call *call, uint32
          const struct vk_vertex_attribute_state *at = &d->vi->attributes[a];
          rec.attr_base[a] = at->offset;
          rec.attr_stride[a] = d->vi_strides[at->binding];
+         rec.attr_instance_limit[a] = mali_gfx_attrib_instance_limit(
+            rec.attr_base[a], rec.attr_stride[a], d->vb[at->binding].size);
       }
       d->dirty |= MALI_GFX_DIRTY_VS_SRT;
    }

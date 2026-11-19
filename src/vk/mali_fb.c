@@ -367,9 +367,15 @@ MALI_PER_ARCH(fb_begin)(struct mali_cmd_buffer *cmd, const struct mali_render_de
       }
    }
 #endif
+   bool feedback_loop = false;
+   for (unsigned i = 0; i < n; i++)
+      feedback_loop |= targets[i]->feedback_loop;
+   /* A dependency in a feedback pass can force a spill of all targets,
+    * including an attachment with final storeOp DONT_CARE. Prepare their
+    * borders before recording any draws. */
    bool afbc_store = false;
    for (unsigned i = 0; i < n; i++)
-      afbc_store |= target_is_afbc(targets[i]) && targets[i]->store;
+      afbc_store |= target_is_afbc(targets[i]) && (targets[i]->store || feedback_loop);
    if (afbc_store) {
       tw = MAX2(tw, AFBC_BLOCK);
       th = MAX2(th, AFBC_BLOCK);
@@ -1159,6 +1165,7 @@ set_target(struct mali_fb_target *t, const struct mali_image_view *view, unsigne
    t->format = format;
    t->load = att_load(att->loadOp);
    t->store = att_store(att);
+   t->feedback_loop = att->imageLayout == VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
 }
 
 static void

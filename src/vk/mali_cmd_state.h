@@ -426,6 +426,16 @@ mali_gfx_fill_sysvals(struct mali_cmd_buffer *cmd, struct mali_graphics_sysvals 
    memset(sv, 0, sizeof(*sv));
 #if PAN_ARCH == 11
    sv->common.poly_params = cmd->poly_params;
+   if (p->fs) {
+      const struct mali_shader_fau *fau = &p->fs->fau;
+      const uint8_t *push = (const uint8_t *)cmd->push_constants;
+      for (unsigned i = 0; i < fau->predecoded_color_count; i++) {
+         uint32_t packed;
+         memcpy(&packed, push + fau->predecoded_color_offsets[i], sizeof(packed));
+         for (unsigned c = 0; c < 4; c++)
+            sv->predecoded_color[i][c] = (float)((packed >> (8 * c)) & 0xffu) * (1.0f / 255.0f);
+      }
+   }
 #endif
    for (unsigned i = 0; i < 4; i++)
       sv->blend.constants[i] = dyn->cb.blend_constants[i];
@@ -442,6 +452,9 @@ mali_gfx_fill_sysvals(struct mali_cmd_buffer *cmd, struct mali_graphics_sysvals 
 
    sv->vs.first_vertex = d->first_vertex;
    sv->vs.base_instance = d->base_instance;
+#if PAN_ARCH == 7
+   sv->v7_draw_id = d->draw_id;
+#endif
    sv->vs.noperspective_varyings = p->bind.noperspective;
 #if PAN_ARCH == 9
    sv->vs.view_index = d->view_index;
@@ -587,21 +600,26 @@ mali_gfx_res_table(struct mali_cmd_buffer *cmd, const struct mali_shader *s,
    return t.gpu | count;
 }
 
-/* One vertex attribute (panvk emit_vs_attrib). */
+/* One vertex attribute (panvk emit_vs_attrib). Hardware compares the fetch
+ * with the bound BUFFER size. Avoid wrapping a large firstInstance back
+ * into the binding while constructing the signed attribute offset. */
 static inline void
 mali_gfx_pack_attrib(const struct vk_vertex_input_state *vi, const uint16_t *strides, uint32_t i,
-                     uint32_t vb_offset, uint32_t base_instance, void *out)
+                     uint32_t vb_offset, uint32_t base_instance, uint64_t bound_size, void *out)
 {
    const struct vk_vertex_attribute_state *a = &vi->attributes[i];
    const struct vk_vertex_binding_state *bs = &vi->bindings[a->binding];
    const uint32_t stride = strides[a->binding];
    const bool per_instance = bs->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE;
    const enum pipe_format f = vk_format_to_pipe_format(a->format);
+   const uint64_t offset = (uint64_t)a->offset +
+                           (per_instance ? (uint64_t)base_instance * stride : 0);
 
    pan_cast_and_pack(out, ATTRIBUTE, cfg) {
-      cfg.offset = a->offset + (per_instance ? base_instance * stride : 0);
+      const bool wrapped_oob = offset > INT32_MAX && offset >= bound_size;
+      cfg.offset = wrapped_oob ? 0 : (int32_t)offset;
       cfg.format = GENX(pan_format_from_pipe_format)(f)->hw;
-      cfg.table = 0;
+      cfg.table = wrapped_oob ? MALI_INVALID_ATTRIB_TABLE : 0;
       cfg.buffer_index = vb_offset + a->binding;
       cfg.stride = stride;
       if (!per_instance) {
@@ -656,11 +674,13 @@ mali_gfx_pack_vs_drv(struct mali_cmd_buffer *cmd, const struct mali_shader *vs,
    for (uint32_t i = 0; i < MALI_MAX_VS_ATTRIBS; i++) {
       void *o = descs + i * MALI_DESCRIPTOR_SIZE;
       if (vi->attributes_valid & BITFIELD_BIT(i)) {
-         mali_gfx_pack_attrib(vi, d->vi_strides, i, vb_offset, d->base_instance, o);
+         uint32_t binding = vi->attributes[i].binding;
+         mali_gfx_pack_attrib(vi, d->vi_strides, i, vb_offset, d->base_instance,
+                              d->vb[binding].size, o);
       } else {
          /* An invalid table makes reads out of bounds (panvk). */
          pan_cast_and_pack(o, ATTRIBUTE, cfg) {
-            cfg.table = 17;
+            cfg.table = MALI_INVALID_ATTRIB_TABLE;
             cfg.format = (MALI_R16F << 12) | MALI_RGB_COMPONENT_ORDER_RGBA;
          }
       }
@@ -1106,6 +1126,9 @@ struct mali_draw_info {
    int32_t vertex_offset;      /* firstVertex or vertexOffset */
    uint32_t first_instance;
    bool indexed;
+#if PAN_ARCH == 7
+   uint32_t draw_id;
+#endif
    uint64_t tess_count_va;     /* internal draw parameters emitted by compute */
    bool tess_indirect_instances;
 };
@@ -1273,6 +1296,7 @@ mali_gfx_update_dirty(struct mali_cmd_buffer *cmd, const struct mali_draw_info *
             .vs = p->vs,
             .fs = p->fs,
             .view_mask = p->state.rp.view_mask,
+            .sampled_feedback_loop = p->sampled_feedback_loop,
             .geometry = p->geometry.main ? &p->geometry.gs : NULL,
             .tess = p->tess.control && !p->geometry.main ? &p->tess : NULL,
          };
@@ -1295,6 +1319,11 @@ mali_gfx_update_dirty(struct mali_cmd_buffer *cmd, const struct mali_draw_info *
    }
    d->first_vertex = di->vertex_offset;
    d->base_instance = di->first_instance;
+#if PAN_ARCH == 7
+   if (d->draw_id != di->draw_id)
+      d->dirty |= MALI_GFX_DIRTY_VS_FAU;
+   d->draw_id = di->draw_id;
+#endif
 
    /* Descriptor sets bound since a stage's table was built. */
    if (d->vs_sets_dirty & bd->vs_sets)

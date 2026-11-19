@@ -223,6 +223,7 @@ struct mali_graphics_pipeline {
    struct vk_vertex_input_state vi;
    struct vk_sample_locations_state sl;
    struct vk_render_pass_state rp;
+   bool sampled_feedback_loop;
 
    struct mali_gfx_baked baked;
 
@@ -266,6 +267,7 @@ struct mali_gfx_pack_input {
    const struct mali_shader *vs;
    const struct mali_shader *fs;       /* may be NULL */
    uint32_t view_mask;                 /* multiview, 0 without */
+   bool sampled_feedback_loop;
 };
 
 MALI_PER_ARCH_DECL(void, gfx_pack_state,

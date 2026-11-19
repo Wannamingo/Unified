@@ -745,8 +745,17 @@ pool_reset(struct mali_device *dev, struct mali_descriptor_pool *pool)
    }
    if (!pool->live_sets)
       return;
-   for (uint32_t i = 0; i < pool->max_sets && pool->live_sets; i++)
-      pool_release_set(dev, pool, &pool->sets[i], false);
+   /* Individual frees can leave a few live sets far into a large pool.
+    * Skip whole free words and release only the allocated slots. */
+   for (uint32_t w = 0; w < BITSET_WORDS(pool->max_sets) && pool->live_sets; w++) {
+      BITSET_WORD allocated = ~pool->free_sets[w];
+      while (allocated && pool->live_sets) {
+         const uint32_t i = w * BITSET_WORDBITS + u_bit_scan(&allocated);
+         if (i >= pool->max_sets)
+            break;
+         pool_release_set(dev, pool, &pool->sets[i], false);
+      }
+   }
    assert(pool->live_sets == 0);
    if (pool->bo.gpu_va) {
       util_vma_heap_finish(&pool->heap);

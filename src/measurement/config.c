@@ -116,6 +116,8 @@ mali_measure_config_parse(const char *str, struct mali_measure_config *c,
             c->timing = true;
          } else if (len == 5 && !strncmp(p, "draws", 5)) {
             c->timing = c->draws = true;
+         } else if (len == 8 && !strncmp(p, "passinfo", 8)) {
+            c->timing = c->passinfo = true;
          } else if (len == 3 && !strncmp(p, "csf", 3)) {
             c->csf = true;
          } else if (len == 4 && !strncmp(p, "both", 4)) {
@@ -126,6 +128,7 @@ mali_measure_config_parse(const char *str, struct mali_measure_config *c,
             c->cpuprof = true;
          } else if (len == 3 && !strncmp(p, "off", 3)) {
             c->timing = c->draws = c->csf = c->shaders = c->cpuprof = false;
+            c->passinfo = false;
          } else {
             ok = false;
          }
@@ -420,8 +423,13 @@ mali_measure_row(struct mali_measure *m, const struct mali_measure_cmd *mc,
    switch (r->kind) {
    case MALI_MEASURE_PASS_VT:
    case MALI_MEASURE_PASS_FRAG:
-      snprintf(info, sizeof(info), "%ux%u rt=%u draws=%u", r->info[0], r->info[1],
-               r->info[2], r->info[3]);
+      if (m->cfg.passinfo && r->kind == MALI_MEASURE_PASS_FRAG && !m->dev->jm) {
+         snprintf(info, sizeof(info), "%ux%u rt=%u draws=%u fs=%016" PRIx64 " passinfo=%08x",
+                  r->info[0], r->info[1], r->info[2], r->info[3], r->shader, r->extra);
+      } else {
+         snprintf(info, sizeof(info), "%ux%u rt=%u draws=%u", r->info[0], r->info[1],
+                  r->info[2], r->info[3]);
+      }
       break;
    case MALI_MEASURE_DISPATCH:
       snprintf(info, sizeof(info), "groups=%ux%ux%u local=%u shader=%016" PRIx64,

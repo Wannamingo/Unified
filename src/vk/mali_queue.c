@@ -56,6 +56,7 @@
 #endif
 
 #include "util/log.h"
+#include "util/format/u_format.h"
 #include "util/os_time.h"
 #include "util/u_atomic.h"
 #include "vk_alloc.h"
@@ -83,20 +84,20 @@ mali_device_set_lost(struct mali_device *dev, const char *fmt, ...)
    vsnprintf(msg, sizeof(msg), fmt, ap);
    va_end(ap);
 
-   if (p_atomic_cmpxchg(&dev->lost_reported, 0, 1) == 0) {
-      /* Always in the log, whatever the build (the runtime's own message
-       * is debug-only). Device loss is never hidden. */
-      mesa_loge("Unified: device lost: %s", msg);
+   pthread_mutex_lock(&dev->lock);
+   const bool first = !dev->lost;
+   if (first) {
+      /* Publish Mesa's flag before waking any backend waiters. */
       vk_device_set_lost(&dev->vk, "%s", msg);
+      snprintf(dev->lost_msg, sizeof(dev->lost_msg), "%s", msg);
+      dev->lost = true;
+      pthread_cond_broadcast(&dev->cond);
+   }
+   pthread_mutex_unlock(&dev->lock);
+   if (first) {
+      mesa_loge("Unified: device lost: %s", msg);
       mali_measure_event(dev, "device lost: %s", msg);
    }
-
-   pthread_mutex_lock(&dev->lock);
-   if (!dev->lost_msg[0])
-      snprintf(dev->lost_msg, sizeof(dev->lost_msg), "%s", msg);
-   dev->lost = true;
-   pthread_cond_broadcast(&dev->cond);
-   pthread_mutex_unlock(&dev->lock);
 }
 
 /* With dev->lock held. A done slot with its error word set means a stream
@@ -384,6 +385,42 @@ preload_option(const char *variable, const char *property)
    return value && !strcmp(value, "1");
 }
 
+void
+mali_load_bin_add(struct mali_load_bins *bins, const struct mali_load_bin *sample)
+{
+   for (unsigned i = 0; i < bins->count; i++) {
+      struct mali_load_bin *bin = &bins->bins[i];
+      if (memcmp(&bin->key, &sample->key, sizeof(bin->key)) != 0)
+         continue;
+      bin->passes += sample->passes;
+      bin->loads += sample->loads;
+      bin->area_loads += sample->area_loads;
+      bin->draws += sample->draws;
+      return;
+   }
+   if (bins->count < ARRAY_SIZE(bins->bins))
+      bins->bins[bins->count++] = *sample;
+   else
+      bins->overflow_loads += sample->loads;
+}
+
+static void
+log_load_bins(const struct mali_load_bins *bins, uint64_t seqno)
+{
+   for (unsigned i = 0; i < bins->count; i++) {
+      const struct mali_load_bin *b = &bins->bins[i];
+      const struct mali_load_key *key = &b->key;
+      mesa_logi("Unified LOADCLASS submit=%" PRIu64 " extent=%ux%u c=%s d=%s s=%s"
+                " mask=%u/%u/%u samples=%u meta=%u passes=%" PRIu64 " loads=%" PRIu64
+                " area_loads=%" PRIu64 " draws=%" PRIu64, seqno, key->width, key->height,
+                util_format_short_name(key->color_format), util_format_short_name(key->depth_format),
+                util_format_short_name(key->stencil_format), key->color_loads, key->depth_load,
+                key->stencil_load, key->samples, key->meta, b->passes, b->loads, b->area_loads, b->draws);
+   }
+   mesa_logi("Unified LOADCLASS overflow submit=%" PRIu64 " loads=%" PRIu64,
+             seqno, bins->overflow_loads);
+}
+
 VkResult
 mali_csf_device_init(struct mali_device *dev)
 {
@@ -416,6 +453,14 @@ mali_csf_device_init(struct mali_device *dev)
    csf->tiler_ir_stats = csf->tiler_ir && debug_get_bool_option("UNIFIED_TILER_IR_STATS", false);
    csf->preload_track = preload_option("UNIFIED_PRELOAD_TRACK", "debug.unified.preload_track");
    csf->preload_stats = preload_option("UNIFIED_PRELOAD_STATS", "debug.unified.preload_stats");
+   csf->preload_profile = preload_option("UNIFIED_LOAD_PROFILE", "debug.unified.load_profile");
+   csf->preload_stats |= csf->preload_profile;
+   csf->preload_direct = UNIFIED_VALIDATION_LAB &&
+      preload_option("UNIFIED_PRELOAD_DIRECT", "debug.unified.preload_direct");
+   csf->zs_load_elide = UNIFIED_VALIDATION_LAB &&
+      preload_option("UNIFIED_ZS_LOAD_ELIDE", "debug.unified.zs_load_elide");
+   mesa_logi("Unified LOAD config track=%u direct=%u profile=%u zs_elide=%u",
+             csf->preload_track, csf->preload_direct, csf->preload_profile, csf->zs_load_elide);
    if (csf->preload_stats)
       mesa_logi("Unified LOAD start track=%u", csf->preload_track);
 
@@ -712,7 +757,8 @@ mali_csf_queue_init(struct mali_device *dev, struct mali_queue *queue)
 
    const struct mali_kbase_group_create_info gi = {
       .cs_count = MALI_SUBQUEUE_COUNT,
-      .priority = KB_QUEUE_GROUP_PRIORITY_MEDIUM,
+      .priority = queue->global_priority == VK_QUEUE_GLOBAL_PRIORITY_LOW ?
+                     KB_QUEUE_GROUP_PRIORITY_LOW : KB_QUEUE_GROUP_PRIORITY_MEDIUM,
       .tiler_oom_handler = csf->tiler_ir,
    };
    enum mali_kbase_result kr = mali_kbase_group_create(kb, &gi, &q->group);
@@ -1088,6 +1134,28 @@ mali_queue_submit(struct vk_queue *vkq, struct vk_queue_submit *submit)
          q->preload.unknown += load->unknown;
          q->preload.overlap += load->overlap;
          q->preload.full_waits += load->full_waits;
+         q->preload.attachment_loads += load->attachment_loads;
+         q->preload.attachment_preloads += load->attachment_preloads;
+         q->preload.feedback_passes += load->feedback_passes;
+         q->preload.feedback_afbc_passes += load->feedback_afbc_passes;
+         q->preload.feedback_splits += load->feedback_splits;
+         q->preload.direct_waits += load->direct_waits;
+         if (csf->preload_profile) {
+            for (unsigned i = 0; i < ARRAY_SIZE(load->zs); i++) {
+               struct mali_zs_load_stats *total = &q->preload.zs[i];
+               const struct mali_zs_load_stats *pass = &load->zs[i];
+               total->passes += pass->passes;
+               total->untracked += pass->untracked;
+               total->depth_unused += pass->depth_unused;
+               total->stencil_unused += pass->stencil_unused;
+               total->depth_elided += pass->depth_elided;
+               total->stencil_elided += pass->stencil_elided;
+            }
+            const struct mali_load_bins *bins = &cmd->gfx.preload.bins;
+            for (unsigned i = 0; i < bins->count; i++)
+               mali_load_bin_add(&q->preload_bins, &bins->bins[i]);
+            q->preload_bins.overflow_loads += bins->overflow_loads;
+         }
       }
       if (order.intra && c + 1 < order.n) {
          for (unsigned i = 0; i < MALI_SUBQUEUE_COUNT; i++)
@@ -1107,10 +1175,29 @@ mali_queue_submit(struct vk_queue *vkq, struct vk_queue_submit *submit)
       const struct mali_preload_stats *load = &q->preload;
       mesa_logi("Unified LOAD track=%u submit=%" PRIu64 " candidates=%" PRIu64
                 " skipped=%" PRIu64 " covered=%" PRIu64 " unknown=%" PRIu64
-                " overlap=%" PRIu64 " full_waits=%" PRIu64,
+                " overlap=%" PRIu64 " full_waits=%" PRIu64 " direct=%" PRIu64,
                 csf->preload_track, seqno, load->candidates, load->skipped,
-                load->covered, load->unknown, load->overlap, load->full_waits);
+                load->covered, load->unknown, load->overlap, load->full_waits, load->direct_waits);
+      mesa_logi("Unified attachment submit=%" PRIu64 " loads=%" PRIu64
+                " preloads=%" PRIu64 " feedback=%" PRIu64 " feedback_afbc=%" PRIu64
+                " feedback_splits=%" PRIu64,
+                seqno, load->attachment_loads, load->attachment_preloads,
+                load->feedback_passes, load->feedback_afbc_passes, load->feedback_splits);
+      if (csf->preload_profile) {
+         for (unsigned i = 0; i < ARRAY_SIZE(load->zs); i++) {
+            const struct mali_zs_load_stats *zs = &load->zs[i];
+            mesa_logi("Unified ZS submit=%" PRIu64 " size=%s passes=%" PRIu64
+                      " untracked=%" PRIu64 " depth_unused=%" PRIu64
+                      " stencil_unused=%" PRIu64 " depth_elided=%" PRIu64
+                      " stencil_elided=%" PRIu64,
+                      seqno, i ? "1280x960" : "other", zs->passes, zs->untracked,
+                      zs->depth_unused, zs->stencil_unused,
+                      zs->depth_elided, zs->stencil_elided);
+         }
+      }
    }
+   if (unlikely(csf->preload_profile) && seqno % 256 == 0)
+      log_load_bins(&q->preload_bins, seqno);
 
    /* Signals: pending until every subqueue reaches what it will have
     * written by the end of this submit. Binary semaphore waits consume

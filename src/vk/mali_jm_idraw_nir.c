@@ -155,6 +155,12 @@ patch_inst_attribs(nir_builder *b, nir_def *rec, nir_def *first_instance, nir_de
    nir_push_if(b, nir_ine_imm(b, mask, 0));
    nir_def *attribs = REC64(b, rec, attribs);
    nir_def *raw_mask = raw ? REC32(b, rec, inst_attr_raw_mask) : NULL;
+#if PAN_ARCH == 7
+   struct mali_attribute_packed zero;
+   pan_pack(&zero, ATTRIBUTE, cfg) {
+      cfg.format = (MALI_CONSTANT << 12) | MALI_RGB_COMPONENT_ORDER_0000;
+   }
+#endif
    for (unsigned a = 0; a < MALI_IDRAW_MAX_ATTRIBS; a++) {
       nir_push_if(b, nir_ine_imm(b, nir_iand_imm(b, mask, 1u << a), 0));
       nir_def *first = first_instance;
@@ -164,7 +170,22 @@ patch_inst_attribs(nir_builder *b, nir_def *rec, nir_def *first_instance, nir_de
       }
       nir_def *v = nir_iadd(b, REC32_AT(b, rec, attr_base, a),
                             nir_imul(b, first, REC32_AT(b, rec, attr_stride, a)));
-      store32(b, v, attribs, a * size + off);
+      nir_def *overflow = nir_ult(b, REC32_AT(b, rec, attr_instance_limit, a), first_instance);
+#if PAN_ARCH == 7
+      nir_def *format = nir_bcsel(b, overflow, nir_imm_int(b, zero.opaque[0]),
+                                  REC32_AT(b, rec, attr_word0, a));
+      store32(b, format, attribs, a * size);
+#else
+      /* v9 shares the v11 ATTRIBUTE layout. Only the low six bits of
+       * word 1 select the resource table; the ordinary table is 0. */
+      nir_def *table_addr = nir_iadd_imm(b, attribs, a * size + 4);
+      nir_def *table = nir_load_global(b, 1, 32, table_addr, .align_mul = 4);
+      table = nir_iand_imm(b, table, ~63u);
+      table = nir_ior(b, table, nir_bcsel(b, overflow, nir_imm_int(b, MALI_INVALID_ATTRIB_TABLE),
+                                          nir_imm_int(b, 0)));
+      store32(b, table, attribs, a * size + 4);
+#endif
+      store32(b, nir_bcsel(b, overflow, nir_imm_int(b, 0), v), attribs, a * size + off);
       nir_pop_if(b, NULL);
    }
    nir_pop_if(b, NULL);

@@ -26,6 +26,23 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/* Mesa's vertex attribute encoding for a nonexistent resource table. */
+#define MALI_INVALID_ATTRIB_TABLE 17
+
+/* The firstInstance multiplication must not wrap back into the range.
+ * Ordinary out of range reads still use the hardware's descriptor bounds. */
+static inline uint32_t
+mali_gfx_attrib_instance_limit(uint32_t offset, uint32_t stride, uint64_t bound_size)
+{
+   const uint64_t last = bound_size > (uint64_t)INT32_MAX + 1 ? bound_size - 1 : INT32_MAX;
+   if (!stride)
+      return UINT32_MAX;
+   if (offset > last)
+      return 0;
+   const uint64_t limit = (last - offset) / stride;
+   return limit < UINT32_MAX ? limit : UINT32_MAX;
+}
+
 #include "util/format/u_formats.h"
 #include "vulkan/vulkan_core.h"
 #include "vk_alloc.h"
@@ -182,6 +199,7 @@ struct mali_fb_target {
     * on v7 an AFBC target of a pass whose tiles are smaller than a
     * superblock (mali_fb.c fb_begin). */
    bool always_write;
+   bool feedback_loop;
 };
 
 struct mali_meta_fs_key;
@@ -290,6 +308,11 @@ struct mali_render_state {
    void *tsd_cpu;
    uint32_t tls_size;               /* largest per-thread TLS of the pass */
    uint32_t draws;                  /* RUN_IDVS + RUN_FULLSCREEN in the pass */
+   bool zs_load_candidate;
+   uint8_t zs_used;                  /* VkImageAspectFlags, depth/stencil only */
+   uint32_t zs_checked_draws;
+   uint64_t measure_single_fs;
+   uint32_t measure_single_vertices;
    /* Vertices (index counts) of the pass's draws, where MALI_PRELOAD_ZS_EARLY. */
    uint64_t verts;
    /* Timing regions of the pass, 0 when not timed. */
@@ -344,6 +367,7 @@ struct mali_gfx_draw_state {
    /* The last values the FAU blocks were built with. */
    int32_t first_vertex;
    uint32_t base_instance;
+   uint32_t draw_id;               /* v7 vertex sysval */
    uint32_t view_index;            /* v9 per-view vertex sysval */
    uint64_t blend_descs[8];         /* fs.blend_descs, from the last blend build */
    uint32_t blend_shader_mask;      /* targets blended by a shader, last blend build */
@@ -694,7 +718,7 @@ struct mali_meta_copy_push {
 #define MALI_META_COPY_WG 8
 
 MALI_PER_ARCH_DECL(const struct mali_shader *, meta_copy_get,
-                   (struct mali_cmd_buffer *cmd, unsigned elem_log2));
+                   (struct mali_cmd_buffer *cmd, unsigned elem_bytes));
 
 /*
  * The raw copy from a linear surface into a u-interleaved one (tile shift

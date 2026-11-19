@@ -1039,11 +1039,98 @@ mali_cmd_emit_barrier(struct mali_cmd_buffer *cmd, const struct mali_cs_deps *in
    }
 }
 
+static bool
+feedback_sample_dependency(VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
+                           VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access,
+                           VkAccessFlags2 attachment_writes)
+{
+   const VkAccessFlags2 writes = vk_filter_src_access_flags2(
+      vk_expand_src_stage_flags2(src_stage), src_access);
+   const VkAccessFlags2 reads = vk_filter_dst_access_flags2(
+      vk_expand_dst_stage_flags2(dst_stage), dst_access);
+
+   return (writes & attachment_writes) && (reads & VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+}
+
+static bool
+needs_feedback_store(const struct mali_render_desc *d, const VkDependencyInfo *info)
+{
+   const struct mali_fb_target *targets[10] = {&d->z, &d->s};
+   for (unsigned i = 0; i < d->rt_count; i++)
+      targets[i + 2] = &d->rt[i];
+
+   VkAccessFlags2 feedback_writes = 0;
+   for (unsigned i = 0; i < d->rt_count + 2; i++) {
+      const struct mali_fb_target *t = targets[i];
+      if (!t->feedback_loop)
+         continue;
+      const VkAccessFlags2 writes = i < 2 ? VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+                                          : VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+      feedback_writes |= writes;
+      for (unsigned j = 0; j < info->imageMemoryBarrierCount; j++) {
+         const VkImageMemoryBarrier2 *b = &info->pImageMemoryBarriers[j];
+         if (mali_image_from_handle(b->image) == t->image &&
+             feedback_sample_dependency(b->srcStageMask, b->srcAccessMask,
+                                        b->dstStageMask, b->dstAccessMask, writes))
+            return true;
+      }
+   }
+   if (!feedback_writes)
+      return false;
+
+   for (unsigned i = 0; i < info->memoryBarrierCount; i++) {
+      const VkMemoryBarrier2 *b = &info->pMemoryBarriers[i];
+      if (feedback_sample_dependency(b->srcStageMask, b->srcAccessMask,
+                                     b->dstStageMask, b->dstAccessMask, feedback_writes))
+         return true;
+   }
+   return false;
+}
+
+static void
+preserve_feedback_attachments(struct mali_render_state *r, struct mali_render_desc *resume)
+{
+   struct mali_fb_target *store[10] = {&r->desc.z, &r->desc.s};
+   struct mali_fb_target *load[10] = {&resume->z, &resume->s};
+   for (unsigned i = 0; i < resume->rt_count; i++) {
+      store[i + 2] = &r->desc.rt[i];
+      load[i + 2] = &resume->rt[i];
+   }
+   for (unsigned i = 0; i < resume->rt_count + 2; i++) {
+      if (!store[i]->image)
+         continue;
+      store[i]->store = true;
+      load[i]->load = MALI_ATT_LOAD_LOAD;
+   }
+}
+
 VKAPI_ATTR void VKAPI_CALL
 MALI_PER_ARCH(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
                                    const VkDependencyInfo *pDependencyInfo)
 {
    VK_FROM_HANDLE(mali_cmd_buffer, cmd, commandBuffer);
+   struct mali_render_state *r = &cmd->gfx.render;
+   /* A primitive barrier orders tile-local input attachment reads. The
+    * sampler reads the backing image instead. Commit prior attachment
+    * writes before making them available to the texture unit. The same
+    * image and modifier back both segments; the final store and resolves
+    * still belong to CmdEndRendering. */
+   if (unlikely(cmd->dev->vk.enabled_features.attachmentFeedbackLoopLayout) &&
+       r->active && needs_feedback_store(&r->desc, pDependencyInfo)) {
+      struct mali_render_desc resume = r->desc;
+      preserve_feedback_attachments(r, &resume);
+      MALI_PER_ARCH(cmd_render_end)(cmd);
+      if (!vk_command_buffer_has_error(&cmd->vk)) {
+         struct mali_cs_deps feedback_deps = {0};
+         mali_cmd_add_deps(cmd, pDependencyInfo, &feedback_deps);
+         mali_cmd_emit_barrier(cmd, &feedback_deps);
+         MALI_PER_ARCH(cmd_render_begin)(cmd, &resume);
+         if (unlikely(cmd->dev->csf->preload_stats))
+            cmd->gfx.preload.stats.feedback_splits++;
+      }
+      return;
+   }
+
    struct mali_cs_deps deps = {0};
    mali_cmd_add_deps(cmd, pDependencyInfo, &deps);
 

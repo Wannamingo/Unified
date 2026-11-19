@@ -72,12 +72,12 @@
 struct mali_meta_gfx {
 #if PAN_ARCH < 9
    /* v7 reads a texture source, an AFBC plane, only in a copy format, so
-    * copy[] holds the raw sources alone ([0][log2 block bytes]) and the
+    * copy[] holds the raw sources alone ([0][block size slot]) and the
     * copies out of AFBC planes are kept by copy format. */
-   struct mali_shader *copy[1][5];
+   struct mali_shader *copy[1][8];
    struct mali_shader *copy_tex_fmt[MALI_META_COPY_FMT_COUNT];
 #else
-   struct mali_shader *copy[2][5];   /* [source is a texture][log2 block bytes] */
+   struct mali_shader *copy[2][8];   /* [source is a texture][block size slot] */
 #endif
    struct mali_shader *copy_quad[3]; /* [log2 block bytes] */
    unsigned count;
@@ -960,11 +960,13 @@ surface_addr(nir_builder *b, nir_def *base, nir_def *layer_stride, nir_def *row_
 }
 
 static nir_shader *
-build_copy(struct mali_device *dev, unsigned elem_log2, bool src_tex)
+build_copy(struct mali_device *dev, unsigned elem, bool src_tex)
 {
-   const unsigned elem = 1u << elem_log2;
+   const bool triplet = !util_is_power_of_two_nonzero(elem);
+   assert(!triplet || !src_tex);
    unsigned comps, bits;
-   raw_block_type(elem, &comps, &bits);
+   const unsigned alignment = triplet ? elem / 3 : elem;
+   raw_block_type(alignment, &comps, &bits);
 
    nir_builder bld = nir_builder_init_simple_shader(
       MESA_SHADER_COMPUTE, MALI_PER_ARCH(shader_nir_options)(dev, MESA_SHADER_COMPUTE),
@@ -983,29 +985,37 @@ build_copy(struct mali_device *dev, unsigned elem_log2, bool src_tex)
    {
       nir_def *sx = nir_iadd(b, gx, copy_push(b, 32, COPY_PUSH(src_x)));
       nir_def *sy = nir_iadd(b, gy, copy_push(b, 32, COPY_PUSH(src_y)));
-      nir_def *v;
-      if (src_tex) {
-         /* txf in the uint format of the block size: the block's bits in
-          * the first components. */
-         v = fetch(b, 0, nir_vec2(b, sx, sy), gz, nir_type_uint32, 0);
-         v = nir_trim_vector(b, v, comps);
-         if (bits < 32)
-            v = nir_u2uN(b, v, bits);
-      } else {
-         nir_def *sa = surface_addr(
-            b, copy_push(b, 64, COPY_PUSH(src)), copy_push(b, 64, COPY_PUSH(src_layer_stride)),
-            copy_push(b, 32, COPY_PUSH(src_row_stride)), sx, sy, gz,
-            copy_push(b, 32, COPY_PUSH(src_tile_shift)), elem);
-         v = nir_load_global(b, comps, bits, sa, .align_mul = MIN2(elem, 16));
-      }
       nir_def *da = surface_addr(
          b, copy_push(b, 64, COPY_PUSH(dst)), copy_push(b, 64, COPY_PUSH(dst_layer_stride)),
          copy_push(b, 32, COPY_PUSH(dst_row_stride)),
          nir_iadd(b, gx, copy_push(b, 32, COPY_PUSH(dst_x))),
          nir_iadd(b, gy, copy_push(b, 32, COPY_PUSH(dst_y))), gz,
          copy_push(b, 32, COPY_PUSH(dst_tile_shift)), elem);
-      nir_store_global(b, v, da, .write_mask = BITFIELD_MASK(comps),
-                       .align_mul = MIN2(elem, 16));
+      if (src_tex) {
+         /* txf in the uint format of the block size: the block's bits in
+          * the first components. */
+         nir_def *v = fetch(b, 0, nir_vec2(b, sx, sy), gz, nir_type_uint32, 0);
+         v = nir_trim_vector(b, v, comps);
+         if (bits < 32)
+            v = nir_u2uN(b, v, bits);
+         nir_store_global(b, v, da, .write_mask = BITFIELD_MASK(comps),
+                          .align_mul = alignment);
+      } else {
+         nir_def *sa = surface_addr(
+            b, copy_push(b, 64, COPY_PUSH(src)), copy_push(b, 64, COPY_PUSH(src_layer_stride)),
+            copy_push(b, 32, COPY_PUSH(src_row_stride)), sx, sy, gz,
+            copy_push(b, 32, COPY_PUSH(src_tile_shift)), elem);
+         /* Packed RGB has no fourth component. Use three naturally
+          * aligned accesses so adjacent invocations never overlap. */
+         const unsigned accesses = triplet ? 3 : 1;
+         for (unsigned i = 0; i < accesses; i++) {
+            const unsigned offset = i * alignment;
+            nir_def *v = nir_load_global(b, comps, bits, nir_iadd_imm(b, sa, offset),
+                                        .align_mul = alignment);
+            nir_store_global(b, v, nir_iadd_imm(b, da, offset),
+                             .write_mask = BITFIELD_MASK(comps), .align_mul = alignment);
+         }
+      }
    }
    nir_pop_if(b, NULL);
    return b->shader;
@@ -1079,12 +1089,13 @@ build_copy_quad(struct mali_device *dev, unsigned elem_log2)
 }
 
 static const struct mali_shader *
-copy_get(struct mali_cmd_buffer *cmd, unsigned elem_log2, bool src_tex)
+copy_get(struct mali_cmd_buffer *cmd, unsigned slot, bool src_tex)
 {
    struct mali_device *dev = cmd->dev;
    struct mali_shader *s = NULL;
 
-   assert(elem_log2 < 5);
+   assert(slot < 8 && (!src_tex || slot < 5));
+   const unsigned elem = slot < 5 ? 1u << slot : 3u << (slot - 5);
 #if PAN_ARCH < 9
    /* v7 has no texture-source slots here (struct mali_meta_gfx). */
    assert(!src_tex);
@@ -1094,9 +1105,9 @@ copy_get(struct mali_cmd_buffer *cmd, unsigned elem_log2, bool src_tex)
       dev->meta_gfx = calloc(1, sizeof(struct mali_meta_gfx));
    struct mali_meta_gfx *mg = dev->meta_gfx;
    if (mg) {
-      s = mg->copy[src_tex][elem_log2];
+      s = mg->copy[src_tex][slot];
       if (!s) {
-         nir_shader *nir = build_copy(dev, elem_log2, src_tex);
+         nir_shader *nir = build_copy(dev, elem, src_tex);
          MALI_PER_ARCH(shader_preprocess)(dev, nir);
          const struct vk_pipeline_robustness_state rs = {
             .storage_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT,
@@ -1110,11 +1121,11 @@ copy_get(struct mali_cmd_buffer *cmd, unsigned elem_log2, bool src_tex)
          _mesa_blake3_init(&h);
          _mesa_blake3_update(&h, src_tex ? "mali-meta-copy-tex" : "mali-meta-copy-image",
                              src_tex ? 18 : 20);
-         _mesa_blake3_update(&h, &elem_log2, sizeof(elem_log2));
+         _mesa_blake3_update(&h, &slot, sizeof(slot));
          _mesa_blake3_final(&h, hash);
          if (MALI_PER_ARCH(shader_compile)(dev, &info, hash, &s) != VK_SUCCESS)
             s = NULL;
-         mg->copy[src_tex][elem_log2] = s;
+         mg->copy[src_tex][slot] = s;
       }
    }
    simple_mtx_unlock(&dev->meta_lock);
@@ -1125,9 +1136,11 @@ copy_get(struct mali_cmd_buffer *cmd, unsigned elem_log2, bool src_tex)
 }
 
 const struct mali_shader *
-MALI_PER_ARCH(meta_copy_get)(struct mali_cmd_buffer *cmd, unsigned elem_log2)
+MALI_PER_ARCH(meta_copy_get)(struct mali_cmd_buffer *cmd, unsigned elem_bytes)
 {
-   return copy_get(cmd, elem_log2, false);
+   const unsigned slot = util_is_power_of_two_nonzero(elem_bytes) ?
+      util_logbase2(elem_bytes) : 5 + util_logbase2(elem_bytes / 3);
+   return copy_get(cmd, slot, false);
 }
 
 const struct mali_shader *

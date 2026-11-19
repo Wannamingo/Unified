@@ -753,15 +753,18 @@ mali_GetDeviceImageSubresourceLayout(VkDevice _device,
    VK_FROM_HANDLE(mali_device, dev, _device);
    struct mali_image image = {0};
    const VkImageCreateInfo *create = pInfo->pCreateInfo;
+   pLayout->subresourceLayout = (VkSubresourceLayout){0};
+   VkSubresourceHostMemcpySize *copy =
+      vk_find_struct(pLayout->pNext, SUBRESOURCE_HOST_MEMCPY_SIZE);
+   if (copy)
+      copy->size = 0;
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
    VkImageCreateInfo normalized;
    VkExternalMemoryImageCreateInfo external_memory_info;
    VkResult normalize = mali_android_external_image_info(dev, create,
       &normalized, &external_memory_info, &image.android_external_format);
-   if (normalize != VK_SUCCESS) {
-      pLayout->subresourceLayout = (VkSubresourceLayout){0};
+   if (normalize != VK_SUCCESS)
       return;
-   }
    create = &normalized;
 #endif
    vk_image_init(&dev->vk, &image.vk, create);
@@ -769,8 +772,6 @@ mali_GetDeviceImageSubresourceLayout(VkDevice _device,
    if (result == VK_SUCCESS)
       mali_GetImageSubresourceLayout2(_device, mali_image_to_handle(&image),
                                      pInfo->pSubresource, pLayout);
-   else
-      pLayout->subresourceLayout = (VkSubresourceLayout){0};
    vk_image_finish(&image.vk);
 }
 

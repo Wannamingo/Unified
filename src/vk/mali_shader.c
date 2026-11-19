@@ -202,6 +202,9 @@ lower_sysvals(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       val = load_sysval(b, graphics, bit_size, vs.noperspective_varyings);
       break;
 #if PAN_ARCH < 9
+   case nir_intrinsic_load_draw_id:
+      val = load_sysval(b, graphics, bit_size, v7_draw_id);
+      break;
    case nir_intrinsic_load_raw_vertex_offset:
       /* gl_VertexIndex = raw vertex id + this (pan_nir_lower_vertex_id). */
       val = load_sysval(b, graphics, bit_size, vs.raw_vertex_offset);
@@ -1091,8 +1094,7 @@ shared_type_info(const struct glsl_type *type, unsigned *size, unsigned *align)
  * Run before descriptor lowering while derefs, dimensions and view queries
  * remain explicit. Buffer images are governed by buffer robustness. */
 static bool
-lower_robust_storage_image(nir_builder *b, nir_intrinsic_instr *intr,
-                           UNUSED void *data)
+lower_robust_storage_image(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
    switch (intr->intrinsic) {
    case nir_intrinsic_image_deref_load:
@@ -1104,7 +1106,10 @@ lower_robust_storage_image(nir_builder *b, nir_intrinsic_instr *intr,
       return false;
    }
    const enum glsl_sampler_dim dim = nir_intrinsic_image_dim(intr);
-   if (dim == GLSL_SAMPLER_DIM_BUF)
+   const struct vk_pipeline_robustness_state *rs = data;
+   if (dim == GLSL_SAMPLER_DIM_BUF ?
+       rs->storage_buffers != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_EXT :
+       rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_ROBUST_IMAGE_ACCESS_EXT)
       return false;
    b->cursor = nir_before_instr(&intr->instr);
    const unsigned coords = nir_image_intrinsic_coord_components(intr);
@@ -1149,11 +1154,8 @@ lower_robust_storage_image(nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
-/* SPDX-License-Identifier: MIT
- * Prototype only: basic robustImageAccess integer texel fetch guards.
- * Insert before descriptor lowering. Buffer images follow buffer robustness;
- * sparse accesses are outside this prototype's feature admission.
- */
+/* Basic robustness for integer-coordinate texel fetches. Sparse access
+ * is outside this driver's feature admission. */
 static nir_def *
 robust_fetch_query(nir_builder *b, const nir_tex_instr *tex, nir_texop op)
 {
@@ -1178,7 +1180,7 @@ robust_fetch_query(nir_builder *b, const nir_tex_instr *tex, nir_texop op)
    /* Query only the valid base mip, never an unchecked caller-provided LOD.
     * Later dimensions are derived below, without shifting array layers. */
    if (op == nir_texop_txs && tex->sampler_dim != GLSL_SAMPLER_DIM_MS &&
-       tex->sampler_dim != GLSL_SAMPLER_DIM_RECT)
+       tex->sampler_dim != GLSL_SAMPLER_DIM_RECT && tex->sampler_dim != GLSL_SAMPLER_DIM_BUF)
       f.lod = nir_imm_int(b, 0);
    nir_def *value = nir_build_tex_struct(b, op, f);
    nir_def_as_tex(value)->texture_non_uniform = tex->texture_non_uniform;
@@ -1186,10 +1188,14 @@ robust_fetch_query(nir_builder *b, const nir_tex_instr *tex, nir_texop op)
 }
 
 static bool
-lower_robust_texel_fetch(nir_builder *b, nir_tex_instr *tex, UNUSED void *data)
+lower_robust_texel_fetch(nir_builder *b, nir_tex_instr *tex, void *data)
 {
-   if ((tex->op != nir_texop_txf && tex->op != nir_texop_txf_ms) ||
-       tex->sampler_dim == GLSL_SAMPLER_DIM_BUF || tex->is_sparse)
+   if ((tex->op != nir_texop_txf && tex->op != nir_texop_txf_ms) || tex->is_sparse)
+      return false;
+   const struct vk_pipeline_robustness_state *rs = data;
+   if (tex->sampler_dim == GLSL_SAMPLER_DIM_BUF ?
+       rs->uniform_buffers != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_EXT :
+       rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_ROBUST_IMAGE_ACCESS_EXT)
       return false;
    /* OpImageFetch does not support Cube. Ordinary cube sampling retains its
     * sampler wrapping semantics and is not changed by this pass. */
@@ -1330,6 +1336,99 @@ ycbcr_conversion(const void *data, uint32_t set, uint32_t binding, uint32_t inde
 }
 #endif
 
+#if PAN_ARCH == 11
+/* Application-side opt-in for the captured local-read shader. The renderer
+ * supplies reciprocals at push offsets 72 and 76 when bit 14 at offset 116
+ * is set. An unmarked draw uses the original texture descriptor query. */
+static bool
+lower_local_read_rcp(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_block *query = NULL;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_tex ||
+             nir_instr_as_tex(instr)->op != nir_texop_txs)
+            continue;
+         if (query)
+            return false;
+         query = block;
+      }
+   }
+   if (!query || query->cf_node.parent->type != nir_cf_node_if)
+      return false;
+   nir_if *linear_if = nir_cf_node_as_if(query->cf_node.parent);
+   nir_block *last_then = nir_if_last_then_block(linear_if);
+   nir_block *last_else = nir_if_last_else_block(linear_if);
+   if (nir_if_first_then_block(linear_if) != query || last_then != query ||
+       nir_if_first_else_block(linear_if) != last_else ||
+       !exec_list_is_empty(&last_else->instr_list))
+      return false;
+
+   nir_block *merge = nir_cf_node_as_block(nir_cf_node_next(&linear_if->cf_node));
+   nir_phi_instr *coord = NULL;
+   nir_foreach_phi(phi, merge) {
+      if (coord || phi->def.bit_size != 32 || phi->def.num_components != 2)
+         return false;
+      coord = phi;
+   }
+   if (!coord)
+      return false;
+
+   nir_def *uv = nir_phi_get_src_from_block(coord, last_else)->src.ssa;
+   nir_def *linear = linear_if->condition.ssa;
+   nir_builder b = nir_builder_at(nir_before_cf_node(&linear_if->cf_node));
+   nir_def *flags = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 116),
+                                          .range = 120, .align_mul = 4);
+   nir_def *hint = nir_ine_imm(&b, nir_iand_imm(&b, flags, 0x4000), 0);
+   nir_def *fast = nir_iand(&b, linear, hint);
+   nir_src_rewrite(&linear_if->condition, nir_iand(&b, linear, nir_inot(&b, hint)));
+
+   b.cursor = nir_after_phis(merge);
+   nir_def *scale = nir_load_push_constant(&b, 2, 32, nir_imm_int(&b, 72),
+                                          .range = 80, .align_mul = 8);
+   nir_def *selected = nir_bcsel(&b, fast, nir_fmul(&b, uv, scale), &coord->def);
+   nir_def_rewrite_uses_after(&coord->def, selected);
+   return nir_progress(true, impl, nir_metadata_control_flow);
+}
+
+/* Move an unpack of a draw's immutable 32-bit push value into its FAU.
+ * The shader's ordering of components and the downstream ALU stay intact. */
+static bool
+lower_push_color(nir_builder *b, nir_alu_instr *alu, void *data)
+{
+   if (alu->op != nir_op_unpack_unorm_4x8 || alu->def.bit_size != 32)
+      return false;
+
+   const nir_def *def = alu->src[0].src.ssa;
+   if (def->bit_size != 32 || nir_def_instr(def)->type != nir_instr_type_intrinsic)
+      return false;
+   const nir_intrinsic_instr *load = nir_instr_as_intrinsic(nir_def_instr(def));
+   if (load->intrinsic != nir_intrinsic_load_push_constant ||
+       !nir_src_is_const(load->src[0]))
+      return false;
+   const uint64_t offset = nir_intrinsic_base(load) + nir_src_as_uint(load->src[0]) +
+                           4 * alu->src[0].swizzle[0];
+   if (offset % 4 || offset > MALI_MAX_PUSH_CONSTANTS_SIZE - 4)
+      return false;
+
+   struct mali_shader_fau *fau = data;
+   unsigned index = 0;
+   while (index < fau->predecoded_color_count && fau->predecoded_color_offsets[index] != offset)
+      index++;
+   if (index == MALI_MAX_PREDECODED_COLORS)
+      return false;
+   if (index == fau->predecoded_color_count) {
+      fau->predecoded_color_offsets[index] = offset;
+      fau->predecoded_color_count++;
+   }
+   b->cursor = nir_before_instr(&alu->instr);
+   nir_def *color = load_sysval_entry(b, graphics, 32, predecoded_color, nir_imm_int(b, index));
+   nir_def_replace(&alu->def, color);
+   return true;
+}
+#endif
+
 /* Resource lowering (panvk_lower_nir). On v7, a table map that cannot be
  * allocated sets s->v7.failed and ends the lowering early. */
 static VkResult
@@ -1358,11 +1457,13 @@ lower_nir(struct mali_device *dev, nir_shader *nir, const struct mali_shader_com
       NIR_PASS(_, nir, nir_vk_lower_ycbcr_tex, ycbcr_conversion, info->layout);
 #endif
 
-   if (rs->images == VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_ROBUST_IMAGE_ACCESS_EXT) {
+   if (rs->images == VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_ROBUST_IMAGE_ACCESS_EXT ||
+       rs->storage_buffers == VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_EXT ||
+       rs->uniform_buffers == VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_EXT) {
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_robust_storage_image,
-               nir_metadata_none, NULL);
+               nir_metadata_none, (void *)rs);
       NIR_PASS(_, nir, nir_shader_tex_pass, lower_robust_texel_fetch,
-               nir_metadata_none, NULL);
+               nir_metadata_none, (void *)rs);
       nir_validate_ssa_dominance(nir, "after basic robust image guards");
    }
 
@@ -1395,6 +1496,22 @@ lower_nir(struct mali_device *dev, nir_shader *nir, const struct mali_shader_com
             nir_address_format_32bit_offset);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_global,
             nir_address_format_64bit_global);
+
+#if PAN_ARCH == 11
+   if (info->local_read_rcp) {
+      bool changed = false;
+      NIR_PASS(changed, nir, lower_local_read_rcp);
+      mesa_logi("Unified local read reciprocal: %s",
+                changed ? "guarded coordinate path active" : "query pattern unmatched");
+   }
+   if (info->predecode_push_colors) {
+      NIR_PASS(_, nir, nir_opt_copy_prop);
+      NIR_PASS(_, nir, nir_opt_constant_folding);
+      NIR_PASS(_, nir, nir_shader_alu_pass, lower_push_color, nir_metadata_control_flow, &s->fau);
+      NIR_PASS(_, nir, nir_opt_constant_folding);
+      NIR_PASS(_, nir, nir_opt_dce);
+   }
+#endif
 
 #if PAN_ARCH >= 9
    if (rs->storage_buffers != VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT) {
@@ -2805,8 +2922,15 @@ shader_deserialize(struct vk_pipeline_cache *cache, const void *key_data,
 #endif
 
    if (blob->overrun || s->info.stage != stage ||
-       s->desc.dyn_bufs.count > MALI_MAX_DYNAMIC_BUFFERS)
+       s->desc.dyn_bufs.count > MALI_MAX_DYNAMIC_BUFFERS ||
+       s->fau.predecoded_color_count > MALI_MAX_PREDECODED_COLORS ||
+       (s->fau.predecoded_color_count && (stage != MESA_SHADER_FRAGMENT || PAN_ARCH != 11)))
       goto fail;
+   for (unsigned i = 0; i < s->fau.predecoded_color_count; i++) {
+      if (s->fau.predecoded_color_offsets[i] % 4 ||
+          s->fau.predecoded_color_offsets[i] > MALI_MAX_PUSH_CONSTANTS_SIZE - 4)
+         goto fail;
+   }
 #if PAN_ARCH < 9
    if (!v7_desc_counts_valid(s))
       goto fail;

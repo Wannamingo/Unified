@@ -366,6 +366,20 @@ load_resource_deref_desc(nir_builder *b, struct lower_desc_ctx *ctx, nir_deref_i
    return nir_load_global(b, num_components, bit_size, addr, .align_mul = align);
 }
 
+static nir_def *
+load_texel_buffer_size(nir_builder *b, struct lower_desc_ctx *ctx,
+                       nir_deref_instr *deref)
+{
+   /* The Attribute Buffer is aligned down. Its encoded size includes the
+    * prefix before the view; the Attribute offset at byte 20 removes it. */
+   nir_def *stride_size =
+      load_resource_deref_desc(b, ctx, deref, MALI_SUBDESC_NONE, 8, 2, 32);
+   nir_def *offset =
+      load_resource_deref_desc(b, ctx, deref, MALI_SUBDESC_NONE, 20, 1, 32);
+   nir_def *bytes = nir_isub(b, nir_channel(b, stride_size, 1), offset);
+   return nir_udiv(b, bytes, nir_channel(b, stride_size, 0));
+}
+
 /* Texture descriptor fields (v7.xml): width and height at byte 4, array
  * size at byte 24 and depth at byte 28, all 16-bit minus one; levels
  * minus one in word 2 bits 16..20; log2 of the sample count in word 3
@@ -374,14 +388,8 @@ static nir_def *
 load_tex_size(nir_builder *b, struct lower_desc_ctx *ctx, nir_deref_instr *deref,
               enum glsl_sampler_dim dim, bool is_array)
 {
-   if (dim == GLSL_SAMPLER_DIM_BUF) {
-      /* A texel buffer is an attribute pair: stride at byte 8, size at 12
-       * of the Attribute Buffer. Both are unsigned: a view of 2 GiB or
-       * more is within maxTexelBufferElements. */
-      nir_def *stride_size =
-         load_resource_deref_desc(b, ctx, deref, MALI_SUBDESC_NONE, 8, 2, 32);
-      return nir_udiv(b, nir_channel(b, stride_size, 1), nir_channel(b, stride_size, 0));
-   }
+   if (dim == GLSL_SAMPLER_DIM_BUF)
+      return load_texel_buffer_size(b, ctx, deref);
 
    nir_def *w_h = load_resource_deref_desc(b, ctx, deref, MALI_SUBDESC_TEXTURE, 4, 2, 16);
    nir_def *depth_or_layers = load_resource_deref_desc(
@@ -416,12 +424,8 @@ static nir_def *
 load_img_size(nir_builder *b, struct lower_desc_ctx *ctx, nir_deref_instr *deref,
               enum glsl_sampler_dim dim, bool is_array)
 {
-   if (dim == GLSL_SAMPLER_DIM_BUF) {
-      /* As a texel buffer's size in load_tex_size. */
-      nir_def *stride_size =
-         load_resource_deref_desc(b, ctx, deref, MALI_SUBDESC_NONE, 8, 2, 32);
-      return nir_udiv(b, nir_channel(b, stride_size, 1), nir_channel(b, stride_size, 0));
-   }
+   if (dim == GLSL_SAMPLER_DIM_BUF)
+      return load_texel_buffer_size(b, ctx, deref);
 
    nir_def *sz = load_resource_deref_desc(b, ctx, deref, MALI_SUBDESC_NONE, 18, 3, 16);
    if (is_array && dim == GLSL_SAMPLER_DIM_CUBE)

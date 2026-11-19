@@ -41,7 +41,7 @@
  * behind a barrier in its fragment chain.
  *
  * On v7 (Bifrost) the blit pass also blits depth and stencil and the
- * slices of 3D images (blit_region_v7), and an unscaled, unflipped blit
+ * slices of 3D images (blit_region_by_slice), and an unscaled, unflipped blit
  * between identical uncompressed, non-AFBC formats of 1, 2, 4, 8 or
  * 16-byte texels is the compute copy instead. v7 compresses and
  * decompresses AFBC by the render target's and the texture's format, so
@@ -142,13 +142,15 @@ dispatch_copy(struct mali_cmd_buffer *cmd, const struct copy_surface *src, int s
    if (!w_blocks || !h_blocks || !layers)
       return;
    const unsigned bytes = src->block_bytes;
-   if (!util_is_power_of_two_nonzero(bytes) || bytes > 16) {
+   const bool power_of_two = util_is_power_of_two_nonzero(bytes);
+   if (!(power_of_two && bytes <= 16) && bytes != 3 && bytes != 6 && bytes != 12) {
       vk_logw(VK_LOG_OBJS(cmd), "Unified: copies of %u-byte blocks are not supported", bytes);
       return;
    }
    /* Linear -> u-interleaved at an aligned spot: the 4x4 groups go through
     * the quad copy, the ragged right and bottom edges through this one. */
-   if (bytes <= 4 && src->tile_shift == 0 && dst->tile_shift == 4 && !(dx & 3) && !(dy & 3) &&
+   if (power_of_two && bytes <= 4 && src->tile_shift == 0 && dst->tile_shift == 4 &&
+       !(dx & 3) && !(dy & 3) &&
        w_blocks >= 4 && h_blocks >= 4) {
       const struct mali_shader *q = MALI_PER_ARCH(meta_copy_quad_get)(cmd, util_logbase2(bytes));
       if (!q)
@@ -182,7 +184,7 @@ dispatch_copy(struct mali_cmd_buffer *cmd, const struct copy_surface *src, int s
       return;
    }
 
-   const struct mali_shader *s = MALI_PER_ARCH(meta_copy_get)(cmd, util_logbase2(bytes));
+   const struct mali_shader *s = MALI_PER_ARCH(meta_copy_get)(cmd, bytes);
    if (!s)
       return;
 
@@ -807,8 +809,8 @@ blit_axis(int32_t s0, int32_t s1, int32_t d0, int32_t d1, uint32_t size, float *
 /*
  * Layers [src_layer, src_layer + layers) of `src` into as many from
  * dst_layer of `dst` (Z slices on a 3D side) for one region of
- * vkCmdBlitImage2 on v7: the blit pass of CmdBlitImage2 below, plus depth
- * and stencil (MALI_META_FS_BLIT as z_op / s_op, the destination's planes
+ * vkCmdBlitImage2, including depth and stencil
+ * (MALI_META_FS_BLIT as z_op / s_op, the destination's planes
  * as the pass's depth and stencil targets; Vulkan allows these only
  * between identical formats, with NEAREST). An unscaled, unflipped region
  * between identical formats with no compressed or AFBC image and texels of
@@ -965,19 +967,17 @@ blit_layers_zs(struct mali_cmd_buffer *cmd, const struct mali_image *src,
    transfer_pass(cmd, &d);
 }
 
-#if PAN_ARCH < 9
 /*
- * One region of vkCmdBlitImage2 on v7. A 2D side's Z range is 0..1 and
- * its layers start at baseArrayLayer. With a 3D side, a region that maps
+ * One region of a depth/stencil blit, or a non-volume color blit on v7.
+ * A 2D side's Z range is 0..1 and its layers start at baseArrayLayer.
+ * With a 3D side, a region that maps
  * the slices one to one in order is one pass over them as layers; any
  * other region takes one pass per destination slice, from the source slice
- * under that slice's centre. The blit pass samples one slice per layer, so
- * Z is not filtered: a LINEAR blit that scales Z reads the nearest source
- * slice.
+ * under that slice's centre. Depth and stencil always use nearest filtering.
  */
 static void
-blit_region_v7(struct mali_cmd_buffer *cmd, const struct mali_image *src,
-               const struct mali_image *dst, const VkImageBlit2 *r, VkFilter filter)
+blit_region_by_slice(struct mali_cmd_buffer *cmd, const struct mali_image *src,
+                     const struct mali_image *dst, const VkImageBlit2 *r, VkFilter filter)
 {
    const uint32_t src_base = r->srcSubresource.baseArrayLayer;
    const uint32_t dst_base = r->dstSubresource.baseArrayLayer;
@@ -1011,7 +1011,6 @@ blit_region_v7(struct mali_cmd_buffer *cmd, const struct mali_image *src,
          return;
    }
 }
-#endif /* PAN_ARCH < 9 */
 
 
 /* A real volume texture supplies filtering inZ as well asXY. One destination
@@ -1079,20 +1078,22 @@ MALI_PER_ARCH(CmdBlitImage2)(VkCommandBuffer commandBuffer, const VkBlitImageInf
 
    for (uint32_t i = 0; i < info->regionCount; i++) {
       const VkImageBlit2 *r = &info->pRegions[i];
-      if (src->vk.image_type == VK_IMAGE_TYPE_3D && dst->vk.image_type == VK_IMAGE_TYPE_3D) {
+      const bool color = r->dstSubresource.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT;
+      /* The volume shader writes a color render target and binds only plane
+       * zero. Depth/stencil need their own targets and per-aspect textures. */
+      if (color && src->vk.image_type == VK_IMAGE_TYPE_3D &&
+          dst->vk.image_type == VK_IMAGE_TYPE_3D) {
          blit_volume_region(cmd,src,dst,r,info->filter);
          if (vk_command_buffer_has_error(&cmd->vk)) return;
          continue;
       }
 #if PAN_ARCH < 9
-      blit_region_v7(cmd, src, dst, r, info->filter);
+      blit_region_by_slice(cmd, src, dst, r, info->filter);
       if (vk_command_buffer_has_error(&cmd->vk))
          return;
 #else
-      if (!(r->dstSubresource.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT)) {
-         blit_layers_zs(cmd, src, dst, r, info->filter,
-            r->srcSubresource.baseArrayLayer, r->dstSubresource.baseArrayLayer,
-            vk_image_subresource_layer_count(&dst->vk, &r->dstSubresource));
+      if (!color) {
+         blit_region_by_slice(cmd, src, dst, r, info->filter);
          if (vk_command_buffer_has_error(&cmd->vk)) return;
          continue;
       }

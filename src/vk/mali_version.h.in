@@ -2,7 +2,9 @@
 #ifndef MALI_VERSION_H
 #define MALI_VERSION_H
 #define MALI_GIT_SHA "@VCS_TAG@"
-#if defined(UNIFIED_API12_LAB) && UNIFIED_API12_LAB
+#if defined(UNIFIED_API13_LAB) && UNIFIED_API13_LAB
+#define MALI_DRIVER_FLAVOR ".api13lab.s"
+#elif defined(UNIFIED_API12_LAB) && UNIFIED_API12_LAB
 #define MALI_DRIVER_FLAVOR ".api12lab.s"
 #else
 #define MALI_DRIVER_FLAVOR ".s"

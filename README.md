@@ -1,48 +1,36 @@
-# Unified
+# Unified 0.4.91 Preview
 
-Unified is a Vulkan driver for Arm Mali GPUs on the stock Arm `kbase` kernel driver. On Android, it is loaded by an application that supports custom GPU driver packages, such as HakuX-Mali.
+Unified is a Vulkan driver for Arm Mali GPUs on Android with the Arm `kbase` kernel driver. The application must support importing custom GPU driver packages.
 
-[Download Unified 0.4.63](https://github.com/Wannamingo/Unified/releases/tag/v0.4.63)
+The 0.4.91 preview uses the Vulkan 1.3 Lab configuration. The exact packaged binary was checked on RG477M (Mali-G615), RG476H (Mali-G57), and RG Rotate (Mali-G52). See [release notes](RELEASE-NOTES-0.4.91.md) for the scope of the tests and the opt-in flags.
 
-Unified 0.4.63 reduces descriptor-pool memory usage. Small CSF pools share GPU memory blocks, and dynamic descriptors use storage sized for the pool. The Android ARM64 package targets API 31 or later and reports Vulkan 1.1.
+## Installation
 
-Mali-G615 exposes experimental geometry and tessellation. Tests on RG477M covered isolines, indirect tessellated draws, and a tessellation evaluation shader feeding a geometry shader. Mali-G57 and Mali-G52 do not expose these shader stages in this build.
-
-On Mali-G52, an empty scissor suppresses rasterization and still runs the vertex shader. Occlusion counters are cleared by query reset, and BeginQuery reuses the reset counters.
-
-For native G615 testing, set `UNIFIED_TILER_IR=1` to use incremental rendering. The separate `UNIFIED_YUV=1` and `UNIFIED_HOST_IMAGE_COPY=1` options retain the scope of 0.4.60. All three options are disabled by default.
-
-## Install / Установка
-
-1. Download the driver ZIP from the release page. Keep the archive intact.
-2. In a compatible app, open its GPU-driver settings and import the ZIP. In HakuX-Mali, use **Settings → GPU driver → Add a driver**.
-3. Select **Unified 0.4.63** and restart the game. To return to the device driver, select **System** and restart the game again.
-
-Скачайте ZIP из Releases. В HakuX-Mali откройте **Настройки → Драйвер GPU → Добавить драйвер**, выберите ZIP, затем **Unified 0.4.63** и перезапустите игру. Для возврата выберите **Системный драйвер** и снова перезапустите игру. Версия HakuX-Mali 1.7.8 распознаёт Unified. Проверенная 1.7.1 на RG Rotate отклоняла драйвер с именем Unified.
+Download the [driver ZIP](https://github.com/Wannamingo/Unified/releases/tag/v0.4.91) and import it intact through the application's GPU driver settings. In HakuX-Mali, select **Settings → GPU driver → Add a driver**. Select the imported driver and restart the game. You can switch back by selecting **System** and restarting again.
 
 ## Build from source
-
-Use Mesa at the revision pinned in `meson.build` and apply the accompanying Mesa patch. `mesa-glue/` defines what to compile.
 
 ```sh
 git clone https://github.com/Wannamingo/Unified.git
 cd Unified
-git checkout v0.4.63
+git checkout v0.4.91
 git init mesa
 git -C mesa fetch --depth 1 https://github.com/bmdhacks/armsx2-turnip.git 45ff8fac44d9132118d0dddd2ff49f5d827533fb
 git -C mesa checkout --detach FETCH_HEAD
-git -C mesa apply ../patches/mesa-0.4.63.patch
+git -C mesa apply ../patches/mesa-0.4.91.patch
 ```
 
-The build needs Meson 1.7+, Ninja, Python with Mako and PyYAML, a native C/C++ toolchain, Rust with the `aarch64-linux-android` target, and bindgen with libclang. The published Android build used NDK `29.0.14206865`, API 31, `-Dmeasurement=true`, `-Dunified_geometry_lab=true` and `-Dunified_tessellation_lab=true`. For a Linux-hosted cross build, copy `cross/android-aarch64.ini` and set `ndk` and `api = '31'` in the copy before configuring Meson.
+The build needs Meson 1.7 or newer, Ninja, Python with Mako and PyYAML, a native C/C++ toolchain, Rust with the `aarch64-linux-android` target, and bindgen with libclang. The preview used NDK `29.0.14206865` with API 31. For a Linux-hosted cross build, copy `cross/android-aarch64.ini` to `cross/android-local.ini`, then set the NDK path and the API to 31.
 
 ```sh
-meson setup build-android --cross-file cross/android-local.ini --buildtype=release -Db_ndebug=true -Dmeasurement=true -Dunified_api12_lab=false -Dunified_geometry_lab=true -Dunified_tessellation_lab=true
+meson setup build-android --cross-file cross/android-local.ini \
+  --buildtype=release -Db_ndebug=true -Dmeasurement=true \
+  -Dunified_api12_lab=true -Dunified_api13_lab=true \
+  -Dunified_validation_lab=true -Dunified_geometry_lab=true \
+  -Dunified_tessellation_lab=true
 meson compile -C build-android
 ```
 
-The build produces `build-android/src/libvulkan_unified.so`. In the Android ZIP, `meta.json` identifies the driver library to load.
+The build produces `build-android/src/libvulkan_unified.so`. The package's `meta.json` identifies the library to load.
 
-## Credits and licensing
-
-Unified is based on the MIT-licensed work of ARMSX2 and bmdhacks and uses Mesa. See [LICENSE](LICENSE) and [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). The release archive includes the dependency license texts. Credit for the JM tiler-heap changes is recorded in the 0.4.51 release notes.
+Unified retains the MIT license and notices of ARMSX2 and bmdhacks. See [LICENSE](LICENSE) and [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

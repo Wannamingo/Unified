@@ -19,7 +19,9 @@ VkImageLayout mali_host_copy_layouts[MALI_HOST_COPY_LAYOUT_COUNT] = {
 bool
 mali_host_copy_enabled(uint32_t arch)
 {
-   return arch == 11 && debug_get_bool_option("UNIFIED_HOST_IMAGE_COPY", false);
+   const bool supported = arch == 11 ||
+      (UNIFIED_API13_LAB && UNIFIED_VALIDATION_LAB && (arch == 7 || arch == 9));
+   return supported && debug_get_bool_option("UNIFIED_HOST_IMAGE_COPY", false);
 }
 
 static bool

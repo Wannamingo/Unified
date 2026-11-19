@@ -831,6 +831,7 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
    out->dcd1 = 0;
    out->dcd2 = 0;
 #else
+   const bool feedback_loop = in->sampled_feedback_loop;
    for (unsigned oq = 0; oq < 2; oq++) {
       struct mali_dcd_flags_0_packed dcd0;
 
@@ -847,8 +848,8 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
             cfg.allow_forward_pixel_to_kill =
                fs->info.fs.can_fpk && !(rt_mask & ~out->rt_written) &&
                !(out->rt_read & out->rt_written) && !a2c && !out->any_dest_read &&
-               !roa_color;
-            cfg.allow_forward_pixel_to_be_killed = !fs->info.writes_global;
+               !roa_color && !feedback_loop;
+            cfg.allow_forward_pixel_to_be_killed = !fs->info.writes_global && !feedback_loop;
 
             struct earlyzs ezs = earlyzs_get(&fs->info, writes_zs || oq, a2c,
                                              zs_test_always_passes(in),
@@ -918,7 +919,8 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
              dyn->ds.depth.compare_op == VK_COMPARE_OP_GREATER_OR_EQUAL) &&
             !dyn->ds.stencil.test_enable && !oq && !out->any_dest_read &&
             !(out->rt_read & out->rt_written) &&
-            !(dyn->rasterization_order_access & VK_IMAGE_ASPECT_COLOR_BIT);
+            !(dyn->rasterization_order_access & VK_IMAGE_ASPECT_COLOR_BIT) &&
+            !feedback_loop;
          cfg.scissor_to_bounding_box = true;
 #if PAN_ARCH >= 10
          cfg.conservative_rast_mode =

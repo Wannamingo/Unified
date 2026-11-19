@@ -803,11 +803,22 @@ emit_attributes(struct mali_cmd_buffer *cmd, const struct mali_graphics_pipeline
       int64_t first = per_instance ? (int64_t)di->first_instance : 0;
       if (per_instance && di->instance_count > 1 && b->divisor && b->divisor < di->instance_count)
          first -= dd->raw_vertex_offset;
+      const uint32_t stride = strides[a->binding];
+      const int64_t offset = (int64_t)a->offset + (int64_t)(addr & 63) + first * stride;
+      const uint64_t first_byte = (uint64_t)a->offset +
+                                  (per_instance ? (uint64_t)di->first_instance * stride : 0);
+      if (!rec && (offset < INT32_MIN || offset > INT32_MAX) &&
+          first_byte >= d->vb[a->binding].size) {
+         pan_pack(&adescs[i], ATTRIBUTE, cfg) {
+            cfg.format = (MALI_CONSTANT << 12) | MALI_RGB_COMPONENT_ORDER_0000;
+         }
+         continue;
+      }
       pan_pack(&adescs[i], ATTRIBUTE, cfg) {
          cfg.buffer_index = a->binding * 2;
          cfg.offset_enable = true;
          cfg.format = GENX(pan_format_from_pipe_format)(vk_format_to_pipe_format(a->format))->hw;
-         cfg.offset = (int64_t)a->offset + (int64_t)(addr & 63) + first * strides[a->binding];
+         cfg.offset = (int32_t)offset;
       }
       /* An indirect draw's per-instance offsets: base + firstInstance x
        * stride, by the patch job (di->first_instance is 0 here). */
@@ -817,6 +828,9 @@ emit_attributes(struct mali_cmd_buffer *cmd, const struct mali_graphics_pipeline
             rec->inst_attr_raw_mask |= BITFIELD_BIT(i);
          rec->attr_base[i] = a->offset + (addr & 63);
          rec->attr_stride[i] = strides[a->binding];
+         rec->attr_instance_limit[i] = mali_gfx_attrib_instance_limit(
+            rec->attr_base[i], stride, d->vb[a->binding].size + (addr & 63));
+         rec->attr_word0[i] = adescs[i].opaque[0];
       }
    }
 
@@ -1643,9 +1657,11 @@ vs_reads_draw_sysvals(const struct mali_shader *vs)
    const unsigned fv = offsetof(struct mali_graphics_sysvals, vs.first_vertex);
    const unsigned bi = offsetof(struct mali_graphics_sysvals, vs.base_instance);
    const unsigned rvo = offsetof(struct mali_graphics_sysvals, vs.raw_vertex_offset);
+   const unsigned draw_id = offsetof(struct mali_graphics_sysvals, v7_draw_id);
    return BITSET_TEST(vs->fau.used_sysvals, fv / MALI_FAU_WORD_SIZE) ||
           BITSET_TEST(vs->fau.used_sysvals, bi / MALI_FAU_WORD_SIZE) ||
-          BITSET_TEST(vs->fau.used_sysvals, rvo / MALI_FAU_WORD_SIZE);
+          BITSET_TEST(vs->fau.used_sysvals, rvo / MALI_FAU_WORD_SIZE) ||
+          BITSET_TEST(vs->fau.used_sysvals, draw_id / MALI_FAU_WORD_SIZE);
 }
 
 /* The address of a vertex shader system value in its FAU block at fau, 0
@@ -1668,7 +1684,9 @@ draw_indirect(struct mali_cmd_buffer *cmd, const struct idraw_call *call, uint32
    const struct mali_shader *vs = p->vs;
 
    /* Placeholders the patch job replaces: one vertex, one instance. */
-   const struct mali_draw_info di = {.count = 1, .instance_count = 1, .indexed = call->indexed};
+   const struct mali_draw_info di = {
+      .count = 1, .instance_count = 1, .indexed = call->indexed, .draw_id = i,
+   };
    struct draw_data dd;
    memset(&dd, 0, sizeof(dd));
    dd.vertex_range = 1;

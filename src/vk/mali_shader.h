@@ -58,6 +58,7 @@ struct vk_pipeline_robustness_state;
 #define MALI_MAX_PUSH_CONSTANTS_SIZE 256
 #define MALI_FAU_WORD_SIZE 8
 #define MALI_FAU_WORD_COUNT 64
+#define MALI_MAX_PREDECODED_COLORS 6
 
 /* Input attachment targets in the iam system values. */
 #define MALI_COLOR_ATTACHMENT(x) (x)
@@ -130,6 +131,8 @@ struct mali_graphics_sysvals {
    /* v7 uses vs.raw_vertex_offset in the word aliased by v9 view_index.
     * Keep both independent, and preserve every existing sysval offset. */
    uint32_t v7_view_index;
+   uint32_t v7_draw_id;
+   float predecoded_color[MALI_MAX_PREDECODED_COLORS][4];
 } __attribute__((aligned(8)));
 
 static_assert(sizeof(((struct mali_graphics_sysvals *)NULL)->v7_desc) ==
@@ -257,6 +260,8 @@ struct mali_shader_fau {
    BITSET_DECLARE(used_push_consts, MALI_MAX_PUSH_CONST_FAUS);
    uint32_t sysval_count;
    uint32_t total_count;
+   uint8_t predecoded_color_count;
+   uint8_t predecoded_color_offsets[MALI_MAX_PREDECODED_COLORS];
    uint32_t const_count;
    uint64_t consts[MALI_MAX_SHADER_FAU_CONSTS];
    uint32_t ubo_push_start;
@@ -496,6 +501,8 @@ MALI_PER_ARCH_DECL(struct spirv_to_nir_options, shader_spirv_options,
 
 struct mali_shader_compile_info {
    bool poly_vertex_inputs;
+   bool predecode_push_colors;
+   bool local_read_rcp;
    /* Consumed (freed) by mali_shader_compile whatever the result. */
    nir_shader *nir;
    const struct vk_pipeline_robustness_state *rs;

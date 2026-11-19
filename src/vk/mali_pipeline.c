@@ -53,6 +53,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
 
 #include "vk_alloc.h"
 #include "compiler/spirv/nir_spirv.h"
@@ -166,11 +169,89 @@ struct stage {
    nir_shader *nir;
    struct mali_shader *shader;
    bool cache_hit;
+   bool compact_fxaa;
+   bool predecode_push_colors;
+   bool local_read_rcp;
    int64_t duration_ns;
    /* Vertex stage: the generic varying slots the fragment stage reads (~0: all, for a
     * pipeline whose fragment stage is unknown). */
    uint64_t keep_outputs;
 };
+
+static bool
+stage_spirv(const VkPipelineShaderStageCreateInfo *info, const uint32_t **words,
+            size_t *size);
+
+#if PAN_ARCH == 11
+static bool
+shader_option(const char *variable, const char *property_name)
+{
+   const char *enabled = getenv(variable);
+#ifdef __ANDROID__
+   char property[PROP_VALUE_MAX];
+   if (!enabled && __system_property_get(property_name, property) > 0)
+      enabled = property;
+#else
+   (void)property_name;
+#endif
+   return enabled && strcmp(enabled, "1") == 0;
+}
+
+static bool
+matches_fragment(const VkPipelineShaderStageCreateInfo *info, size_t captured_size,
+                 const blake3_hash captured)
+{
+   if (info->stage != VK_SHADER_STAGE_FRAGMENT_BIT || info->pSpecializationInfo ||
+       strcmp(info->pName, "main") != 0)
+      return false;
+   const uint32_t *words;
+   size_t size;
+   if (!stage_spirv(info, &words, &size) || size != captured_size)
+      return false;
+   blake3_hash hash;
+   _mesa_blake3_compute(words, size, hash);
+   return memcmp(hash, captured, sizeof(hash)) == 0;
+}
+
+static bool
+compact_fxaa_stage(const VkPipelineShaderStageCreateInfo *info)
+{
+   /* Keep this experiment restricted to the exact captured FXAA module. */
+   static const blake3_hash captured = {
+      0x8f, 0xb5, 0xc8, 0xa7, 0xa4, 0x6a, 0xc5, 0xc8,
+      0x84, 0xb6, 0x65, 0xee, 0x0a, 0x85, 0x8c, 0xbb,
+      0x14, 0xce, 0x10, 0x4d, 0x17, 0x7d, 0x17, 0xf1,
+      0x51, 0x98, 0x31, 0x7f, 0x83, 0x25, 0xd0, 0x0d,
+   };
+   return UNIFIED_COMPACT_FXAA_LAB &&
+          shader_option("UNIFIED_COMPACT_FXAA", "debug.unified.compact_fxaa") &&
+          matches_fragment(info, 14484, captured);
+}
+
+static bool
+local_read_stage(const VkPipelineShaderStageCreateInfo *info)
+{
+   static const blake3_hash captured = {
+      0x4d, 0x63, 0x17, 0x88, 0xa0, 0x1b, 0x5a, 0x2a,
+      0xb5, 0xa3, 0x4d, 0x12, 0x12, 0xc9, 0xe8, 0x9d,
+      0x2b, 0x36, 0xfd, 0xde, 0x36, 0x5d, 0xae, 0xe3,
+      0x5c, 0xee, 0x7a, 0x00, 0x9c, 0x4d, 0x34, 0x2c,
+   };
+   return matches_fragment(info, 28912, captured);
+}
+
+static void
+keep_fxaa_search_loop(nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_loop *loop = nir_block_get_following_loop(block);
+         if (loop && loop->control == nir_loop_control_none)
+            loop->control = nir_loop_control_dont_unroll;
+      }
+   }
+}
+#endif
 
 static struct vk_pipeline_cache *
 pick_cache(struct mali_device *dev, VkPipelineCache handle)
@@ -206,6 +287,26 @@ stage_init(struct mali_device *dev, VkPipelineCreateFlags2KHR flags,
       st->rs.storage_buffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_EXT;
 #endif
    vk_pipeline_hash_shader_stage(flags, info, &st->rs, st->stage_hash);
+#if PAN_ARCH == 11
+   st->compact_fxaa = compact_fxaa_stage(info);
+   if (UNIFIED_PUSH_COLOR_LAB &&
+       shader_option("UNIFIED_PUSH_COLORS", "debug.unified.push_colors") &&
+       local_read_stage(info)) {
+      st->predecode_push_colors = true;
+      st->local_read_rcp = shader_option("UNIFIED_LOCAL_READ_RCP",
+                                        "debug.unified.local_read_rcp");
+   }
+   if (st->compact_fxaa || st->predecode_push_colors) {
+      const char *variant = st->compact_fxaa ? "unified-fxaa-loop-v1"
+                           : st->local_read_rcp ? "unified-push-color-local-read-rcp-v1"
+                                              : "unified-push-color-v1";
+      struct mesa_blake3 hash;
+      _mesa_blake3_init(&hash);
+      _mesa_blake3_update(&hash, st->stage_hash, sizeof(st->stage_hash));
+      _mesa_blake3_update(&hash, variant, strlen(variant));
+      _mesa_blake3_final(&hash, st->stage_hash);
+   }
+#endif
 }
 
 static bool
@@ -278,10 +379,24 @@ stage_to_nir(struct mali_device *dev, VkPipelineCreateFlags2KHR flags, struct st
                        "the %s stage's SPIR-V was rejected by the SPIR-V front end",
                        mesa_shader_stage_name(stage));
 
+#if PAN_ARCH == 11
+   if (st->compact_fxaa)
+      keep_fxaa_search_loop(st->nir);
+#endif
+
    /* libpoly must see the original stage IO and TCS's output barriers. */
    if (stage != MESA_SHADER_GEOMETRY &&
-       stage != MESA_SHADER_TESS_CTRL && stage != MESA_SHADER_TESS_EVAL)
+       stage != MESA_SHADER_TESS_CTRL && stage != MESA_SHADER_TESS_EVAL) {
+      const struct nir_shader_compiler_options *original = st->nir->options;
+      struct nir_shader_compiler_options options;
+      if (st->predecode_push_colors) {
+         options = *original;
+         options.lower_unpack_unorm_4x8 = false;
+         st->nir->options = &options;
+      }
       MALI_PER_ARCH(shader_preprocess)(dev, st->nir);
+      st->nir->options = original;
+   }
    return VK_SUCCESS;
 }
 
@@ -421,6 +536,8 @@ stage_compile(struct mali_device *dev, struct vk_pipeline_cache *cache,
       st->nir->info.stage == MESA_SHADER_FRAGMENT ? fs_input_mask(st->nir) : 0;
 
    const struct mali_shader_compile_info info = {
+      .predecode_push_colors = st->predecode_push_colors,
+      .local_read_rcp = st->local_read_rcp,
       .nir = st->nir,
       .rs = &st->rs,
       .layout = layout,
@@ -438,6 +555,12 @@ stage_compile(struct mali_device *dev, struct vk_pipeline_cache *cache,
     * not the final backend's possibly reduced varying mask. */
    if (shader->stage == MESA_SHADER_FRAGMENT)
       shader->fs.preprocessed_inputs_read = preprocessed_inputs_read;
+   if (st->compact_fxaa)
+      mesa_logi("Unified FXAA loop variant: %u bytes, %u work registers",
+                shader->bin_size, shader->info.work_reg_count);
+   if (st->predecode_push_colors)
+      mesa_logi("Unified push colors: %u decoded constants, %u bytes",
+                shader->fau.predecoded_color_count, shader->bin_size);
    p_atomic_inc(&dev->pipeline_stats.shaders_compiled);
    stage_dump(st, shader);
 
@@ -1189,6 +1312,7 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
    vk_dynamic_graphics_state_fill(&p->state, &state);
    if (state.rp)
       p->rp = *state.rp;
+   p->sampled_feedback_loop = state.feedback_loop_not_input_only;
 
    p->baked.uses_dynamic_state = baked_words_use_dynamic_state(state.dynamic);
    const struct mali_gfx_pack_input pack = {
@@ -1199,6 +1323,7 @@ create_graphics_pipeline(struct mali_device *dev, VkPipelineCache cache_handle,
       .vs = p->vs,
       .fs = p->fs,
       .view_mask = view_mask,
+      .sampled_feedback_loop = p->sampled_feedback_loop,
    };
    MALI_PER_ARCH(gfx_pack_state)(&pack, &p->baked);
    MALI_PER_ARCH(blend_shaders_prepare)(dev, p);

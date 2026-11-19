@@ -1133,6 +1133,7 @@ struct mali_jm_device {
 
 struct mali_jm_queue {
    struct mali_device *dev;
+   uint8_t priority;
    /* The newest atom in each slot's order. */
    mali_jm_ref last[MALI_JM_SLOT_COUNT];
    /* Per tiler heap slot, the last fragment atom that used it. */

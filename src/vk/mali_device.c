@@ -18,6 +18,8 @@
 
 #include "c11/threads.h"
 #include "util/log.h"
+#include "util/os_time.h"
+#include "util/u_atomic.h"
 #include "util/u_debug.h"
 
 #include "vk_alloc.h"
@@ -39,6 +41,32 @@ MALI_PER_ARCH_DECL(void, cmd_configure_resource_bind_dispatch,
                    (struct vk_device_dispatch_table *dispatch));
 #include "util/stack_array.h"
 #include "mali_pipeline.h"
+
+/* An emulated timeline without a submitted signal sleeps on a different
+ * condition variable from the backend. Bound each host wait so a loss
+ * recorded on another thread is observed even without a semaphore signal. */
+static VkResult
+wait_semaphores_with_loss(struct mali_device *dev, const VkSemaphoreWaitInfo *info,
+                          uint64_t timeout)
+{
+   const uint64_t slice_ns = 20000000;
+   const uint64_t deadline = os_time_get_absolute_timeout(timeout);
+   uint64_t interval = MIN2(timeout, slice_ns);
+   for (;;) {
+      VkResult result = dev->cmd_dispatch.WaitSemaphores(mali_device_to_handle(dev),
+                                                        info, interval);
+      if (result != VK_TIMEOUT)
+         return result;
+      if (vk_device_is_lost_no_report(&dev->vk))
+         return VK_ERROR_DEVICE_LOST;
+      uint64_t now = os_time_get_nano();
+      if (now >= deadline)
+         return VK_TIMEOUT;
+      interval = MIN2(deadline - now, slice_ns);
+   }
+}
+
+#include "mali_device_lost.h"
 
 #ifndef __ANDROID__
 #include "wsi_common.h"
@@ -159,6 +187,9 @@ queue_init(struct mali_device *dev, struct mali_queue *queue,
    VkResult result = vk_queue_init(&queue->vk, &dev->vk, info, index);
    if (result != VK_SUCCESS)
       return result;
+   const VkDeviceQueueGlobalPriorityCreateInfo *priority =
+      vk_find_struct_const(info->pNext, DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO);
+   queue->global_priority = priority ? priority->globalPriority : VK_QUEUE_GLOBAL_PRIORITY_MEDIUM;
    /* CSF: the queue group, its rings and the tiler heap (mali_queue.c).
     * Job manager: the slot-order and submission state (mali_jm_queue.c). */
    const uint32_t arch = mali_device_physical(dev)->arch;
@@ -232,11 +263,25 @@ device_get_timestamp(struct vk_device *vk_dev, uint64_t *timestamp)
              VK_ERROR_DEVICE_LOST;
 }
 
-/* Mesa's lookup, and malisx2's own commands by name (mali_vk.h). */
+#if UNIFIED_VALIDATION_LAB
+static VKAPI_ATTR void VKAPI_CALL
+arm_device_loss_test(VkDevice handle)
+{
+   struct mali_device *dev = mali_device_from_handle(handle);
+   p_atomic_set(&dev->test_lose_on_event_status, 1);
+}
+#endif
+
+/* Mesa's lookup, and private commands by name. */
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 mali_GetDeviceProcAddr(VkDevice _device, const char *pName)
 {
    VK_FROM_HANDLE(vk_device, device, _device);
+#if UNIFIED_VALIDATION_LAB
+   if (device && pName && device->enabled_features.maintenance5 &&
+       !strcmp(pName, "vkUnifiedTestArmDeviceLoss"))
+      return (PFN_vkVoidFunction)arm_device_loss_test;
+#endif
    if (device && pName && !strcmp(pName, "vkCmdSetIndexRangeMALISX2")) {
       const struct mali_physical_device *pdev =
          container_of(device->physical, struct mali_physical_device, vk);
@@ -337,6 +382,8 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
    /* vk_device_init clears the vk_device, so wire replay only afterwards. */
    dev->cmd_dispatch = primary;
    dev->vk.command_dispatch_table = &dev->cmd_dispatch;
+   if (dev->vk.enabled_features.maintenance5)
+      install_device_loss_dispatch(&dev->vk.dispatch_table);
    dev->skip_redundant_resource_binds =
       (pdev->arch == 9 || pdev->arch == 11) &&
       debug_get_bool_option("UNIFIED_SKIP_REDUNDANT_RESOURCE_BINDS", false);
@@ -355,6 +402,17 @@ mali_CreateDevice(VkPhysicalDevice physicalDevice,
          result = vk_errorf(pdev, VK_ERROR_INITIALIZATION_FAILED,
                             "unsupported queue request: family %u, %u queues, flags 0x%x",
                             q->queueFamilyIndex, q->queueCount, q->flags);
+         vk_device_finish(&dev->vk);
+         vk_free2(&instance->vk.alloc, pAllocator, dev);
+         return result;
+      }
+      const VkDeviceQueueGlobalPriorityCreateInfo *priority =
+         vk_find_struct_const(q->pNext, DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO);
+      if (priority && priority->globalPriority != VK_QUEUE_GLOBAL_PRIORITY_LOW &&
+          priority->globalPriority != VK_QUEUE_GLOBAL_PRIORITY_MEDIUM) {
+         result = vk_errorf(pdev, VK_ERROR_INITIALIZATION_FAILED,
+                             "global priority %d is unavailable for queue family %u",
+                             priority->globalPriority, q->queueFamilyIndex);
          vk_device_finish(&dev->vk);
          vk_free2(&instance->vk.alloc, pAllocator, dev);
          return result;

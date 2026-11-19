@@ -76,6 +76,11 @@ mali_format_planes(VkFormat format, enum pipe_format planes[MALI_IMAGE_MAX_PLANE
 VkFormatFeatureFlags
 mali_format_image_features(const struct mali_physical_device *pdev, VkFormat format)
 {
+   /* This four-component format requires a YCbCr conversion without
+    * VK_EXT_rgba10x6_formats. Our conversion only supports the 8-bit
+    * multi-plane formats described by mali_format_planes(). */
+   if (format == VK_FORMAT_R10X6G10X6B10X6A10X6_UNORM_4PACK16)
+      return 0;
    if (mali_format_is_ycbcr(format)) {
       if (!mali_ycbcr_enabled(pdev->arch))
          return 0;
@@ -90,6 +95,8 @@ mali_format_image_features(const struct mali_physical_device *pdev, VkFormat for
 VkFormatFeatureFlags
 mali_format_buffer_features(const struct mali_physical_device *pdev, VkFormat format)
 {
+   if (format == VK_FORMAT_R10X6G10X6B10X6A10X6_UNORM_4PACK16)
+      return 0;
    return mali_arch_dispatch(pdev->arch, format_buffer_features, pdev, format);
 }
 
@@ -297,12 +304,15 @@ image_format_properties(const struct mali_physical_device *pdev,
          return VK_ERROR_FORMAT_NOT_SUPPORTED;
    }
 
-   /* Limit the DS4x candidate to formats covered by its dedicated exact
-    * sample-zero native oracle. D24 and other DS layouts stay1x until tested.
-    * Imported/linear images retain their separate1x restrictions. */
+   /* Exercise D24 independently before enabling it for normal clients.
+    * Imported and linear images keep their existing single-sample path. */
+   const bool d24 = info->format == VK_FORMAT_X8_D24_UNORM_PACK32 ||
+                    info->format == VK_FORMAT_D24_UNORM_S8_UINT;
+   const bool test_d24 = d24 && UNIFIED_VALIDATION_LAB &&
+                         debug_get_bool_option("UNIFIED_D24_MSAA", false);
    const bool ds_msaa_candidate = info->format == VK_FORMAT_D16_UNORM ||
       info->format == VK_FORMAT_D32_SFLOAT || info->format == VK_FORMAT_S8_UINT ||
-      info->format == VK_FORMAT_D32_SFLOAT_S8_UINT;
+      info->format == VK_FORMAT_D32_SFLOAT_S8_UINT || test_d24;
    /* Multisampling: optimal 2D attachments, not cube, not storage. */
    VkSampleCountFlags samples = VK_SAMPLE_COUNT_1_BIT;
    if (info->tiling == VK_IMAGE_TILING_OPTIMAL && info->type == VK_IMAGE_TYPE_2D &&
@@ -314,6 +324,8 @@ image_format_properties(const struct mali_physical_device *pdev,
       enum pipe_format planes[MALI_IMAGE_MAX_PLANES];
       mali_format_planes(info->format, planes);
       samples = mali_physical_device_sample_counts(pdev, util_format_get_blocksize(planes[0]));
+      if (test_d24)
+         samples &= VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
    }
 
    *props = (VkImageFormatProperties) {
@@ -325,6 +337,18 @@ image_format_properties(const struct mali_physical_device *pdev,
       .maxResourceSize = pdev->vk.properties.maxMemoryAllocationSize,
    };
    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+mali_GetPhysicalDeviceSparseImageFormatProperties2(
+   UNUSED VkPhysicalDevice physicalDevice,
+   UNUSED const VkPhysicalDeviceSparseImageFormatInfo2 *pFormatInfo,
+   uint32_t *pPropertyCount,
+   UNUSED VkSparseImageFormatProperties2 *pProperties)
+{
+   /* The device has no sparse binding. Both count and array queries
+    * return zero, without modifying the caller's array. */
+   *pPropertyCount = 0;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL

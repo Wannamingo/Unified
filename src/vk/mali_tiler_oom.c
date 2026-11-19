@@ -308,3 +308,4 @@ mali_tiler_ir_finish(struct mali_cmd_buffer *cmd, const struct mali_render_state
       }
    }
 }
+

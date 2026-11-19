@@ -52,6 +52,35 @@
 
 struct mali_shader;
 
+struct mali_load_key {
+   uint32_t width, height;
+   uint32_t color_format, depth_format, stencil_format;
+   uint32_t color_loads, depth_load, stencil_load;
+   uint32_t samples, meta;
+};
+
+struct mali_load_bin {
+   struct mali_load_key key;
+   uint64_t passes, loads, area_loads, draws;
+};
+
+struct mali_load_bins {
+   struct mali_load_bin bins[24];
+   unsigned count;
+   uint64_t overflow_loads;
+};
+
+void mali_load_bin_add(struct mali_load_bins *bins, const struct mali_load_bin *sample);
+
+struct mali_zs_load_stats {
+   uint64_t passes;
+   uint64_t untracked;
+   uint64_t depth_unused;
+   uint64_t stencil_unused;
+   uint64_t depth_elided;
+   uint64_t stencil_elided;
+};
+
 struct mali_preload_stats {
    uint64_t candidates;
    uint64_t skipped;
@@ -59,6 +88,13 @@ struct mali_preload_stats {
    uint64_t unknown;
    uint64_t overlap;
    uint64_t full_waits;
+   uint64_t attachment_loads;
+   uint64_t attachment_preloads;
+   uint64_t feedback_passes;
+   uint64_t feedback_afbc_passes;
+   uint64_t feedback_splits;
+   uint64_t direct_waits;
+   struct mali_zs_load_stats zs[2]; /* other sizes, 1280x960 */
 };
 
 struct mali_csf_device {
@@ -72,6 +108,9 @@ struct mali_csf_device {
    bool shared_sb;
    bool preload_track;
    bool preload_stats;
+   bool preload_profile;
+   bool preload_direct;
+   bool zs_load_elide;
    bool tiler_ir;
    bool tiler_ir_force;
    bool tiler_ir_stats;
@@ -131,6 +170,7 @@ struct mali_csf_queue {
    /* Submits handed to the rings so far; submit N writes N into done[]. */
    uint64_t seqno;
    struct mali_preload_stats preload;
+   struct mali_load_bins preload_bins;
    /* The last submit number each subqueue will write into its done slot;
     * a subqueue that had no work since keeps its old value. */
    uint64_t last_signal[MALI_SUBQUEUE_COUNT];

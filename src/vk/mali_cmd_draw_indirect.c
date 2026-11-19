@@ -288,13 +288,34 @@ draw_indirect(struct mali_cmd_buffer *cmd, bool indexed, uint64_t params, uint32
          cs_store(b, cs_reg_tuple(b, IDVS(VERTEX_OFFSET), 2), base, BITFIELD_MASK(2), sv_off);
       u_foreach_bit(i, attribs) {
          const struct vk_vertex_attribute_state *a = &d->vi->attributes[i];
+         const uint32_t stride = d->vi_strides[a->binding];
+         const uint64_t bound_size = d->vb[a->binding].size;
+         const uint32_t limit = mali_gfx_attrib_instance_limit(a->offset, stride, bound_size);
+         const uint32_t dst = drv_off + i * MALI_DESCRIPTOR_SIZE;
          /* The offset a direct draw with this first instance packs
           * (mali_gfx_pack_attrib). */
          cs_flush_stores(b);   /* acc may still be a store's source */
          cs_move32_to(b, acc, a->offset);
-         cs_if(b, MALI_CS_CONDITION_NEQUAL, first_instance)
-            emit_mul_add(b, acc, first_instance, d->vi_strides[a->binding], bit, tmp);
-         cs_store32(b, acc, base, drv_off + i * MALI_DESCRIPTOR_SIZE + 2 * 4);
+         if (limit == UINT32_MAX) {
+            cs_if(b, MALI_CS_CONDITION_NEQUAL, first_instance)
+               emit_mul_add(b, acc, first_instance, stride, bit, tmp);
+         } else {
+            struct mali_attribute_packed packed;
+            mali_gfx_pack_attrib(d->vi, d->vi_strides, i, vb_offset, 0, bound_size, &packed);
+            const uint32_t first_invalid = limit + 1;
+            cs_move32_to(b, bit, first_invalid);
+            cs_umin32(b, tmp, first_instance, bit);
+            cs_add_imm32(b, tmp, tmp, (int32_t)(0u - first_invalid));
+            cs_if(b, MALI_CS_CONDITION_NEQUAL, tmp) {
+               emit_mul_add(b, acc, first_instance, stride, bit, tmp);
+               cs_move32_to(b, bit, packed.opaque[1]);
+            } cs_else(b) {
+               cs_move32_to(b, bit, (packed.opaque[1] & ~63u) | MALI_INVALID_ATTRIB_TABLE);
+               cs_move32_to(b, acc, 0);
+            }
+            cs_store32(b, bit, base, dst + 4);
+         }
+         cs_store32(b, acc, base, dst + 8);
       }
       cs_flush_stores(b);
 

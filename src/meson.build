@@ -111,6 +111,13 @@ mali_version_h = vcs_tag(
   fallback : 'unknown',
 )
 
+mali_device_lost_h = custom_target(
+  'mali_device_lost',
+  input : [files('vk/gen_device_lost.py'), vk_api_xml],
+  output : 'mali_device_lost.h',
+  command : [prog_python, '@INPUT0@', '@INPUT1@', '@OUTPUT@'],
+)
+
 # pipelineCacheUUID comes from a hash of the sources that can change shader
 # binaries (vk/gen_shader_cache_id.py), not from the commit, so a driver
 # update that leaves the compiler alone keeps applications' pipeline caches.
@@ -127,13 +134,19 @@ mali_shader_cache_id_h = custom_target(
   build_always_stale : true,
 )
 
+if get_option('unified_api13_lab') and not (get_option('unified_api12_lab') and get_option('unified_validation_lab'))
+  error('The Vulkan 1.3 lab requires unified_api12_lab and unified_validation_lab')
+endif
+
 _vk_c_args = [
   pre_args, malisx2_c_args,
   '-DMALI_PAN_ARCH=@0@'.format(pan_arch),
   '-DMALI_VERSION_STRING="@0@"'.format(meson.project_version()),
   '-DUNIFIED_API12_LAB=@0@'.format(get_option('unified_api12_lab') ? '1' : '0'),
+  '-DUNIFIED_API13_LAB=@0@'.format(get_option('unified_api13_lab') ? '1' : '0'),
   '-DUNIFIED_GEOMETRY_LAB=@0@'.format(get_option('unified_geometry_lab') ? '1' : '0'),
   '-DUNIFIED_TESSELLATION_LAB=@0@'.format(get_option('unified_tessellation_lab') ? '1' : '0'),
+  '-DUNIFIED_VALIDATION_LAB=@0@'.format(get_option('unified_validation_lab') ? '1' : '0'),
 ]
 
 # The files built once per GPU architecture:
@@ -194,7 +207,7 @@ malisx2_vk = static_library(
   # Timing, command-stream capture and the CPU profile (MALISX2_MEASURE).
   files('measurement/config.c', 'measurement/cpuprof.c', 'measurement/recorder.c',
         'measurement/timing.c'),
-  mali_entrypoints, mali_waist_stubs, mali_version_h, mali_shader_cache_id_h,
+  mali_entrypoints, mali_waist_stubs, mali_version_h, mali_shader_cache_id_h, mali_device_lost_h,
   include_directories : [inc_include, inc_src, inc_malisx2, include_directories('vk'),
                          include_directories('measurement')],
   c_args : _vk_c_args,
@@ -211,7 +224,9 @@ malisx2_vk_v11 = static_library(
   _vk_per_arch_files,
   mali_entrypoints[0],   # the header only; the tables are malisx2_vk's
   include_directories : _vk_inc,
-  c_args : [pre_args, malisx2_c_args, '-DPAN_ARCH=11', '-DMALI_PAN_ARCH=11'],
+  c_args : [pre_args, malisx2_c_args, '-DPAN_ARCH=11', '-DMALI_PAN_ARCH=11',
+            '-DUNIFIED_COMPACT_FXAA_LAB=@0@'.format(get_option('unified_validation_lab') ? '1' : '0'),
+            '-DUNIFIED_PUSH_COLOR_LAB=@0@'.format(get_option('unified_validation_lab') ? '1' : '0')],
   dependencies : [_vk_per_arch_deps, idep_pan_format_by_arch['11'],
                   idep_pan_packers_by_arch['11']],
   gnu_symbol_visibility : 'hidden',

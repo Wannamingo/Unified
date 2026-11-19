@@ -118,7 +118,6 @@ mali_BindBufferMemory2(VkDevice _device, uint32_t bindInfoCount,
           (mem->dmabuf_fd < 0 || mem->vk.memory_type_index != MALI_MEMORY_TYPE_EXTERNAL_CACHED ||
            !(buf->external_handles & (mem->vk.import_handle_type | mem->vk.export_handle_types)) ||
            pBindInfos[i].memoryOffset % MALI_BUFFER_ALIGNMENT ||
-           pBindInfos[i].memoryOffset % MALI_BUFFER_ALIGNMENT ||
           pBindInfos[i].memoryOffset > mem->vk.size ||
            buf->vk.size > mem->vk.size - pBindInfos[i].memoryOffset)) {
          if (status) *status->pResult = VK_ERROR_INVALID_EXTERNAL_HANDLE;

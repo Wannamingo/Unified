@@ -65,6 +65,7 @@ struct vk_queue_submit;
 struct mali_measure_config {
    bool timing;            /* passes and dispatches */
    bool draws;             /* also every draw (implies timing) */
+   bool passinfo;          /* classify single-draw passes without timing draws */
    bool csf;               /* command-stream capture */
    bool shaders;           /* every compiled shader, to <dir>/shaders */
    bool cpuprof;           /* driver CPU time per thread, logged (cpuprof.c) */

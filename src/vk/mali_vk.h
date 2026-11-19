@@ -34,19 +34,27 @@
  * at; the blob creates at most four. */
 #define MALI_MAX_PHYSICAL_DEVICES 4
 
-/* Normal builds retain the existing1.1 front end. The isolated build-time
- * lab admits1.2/SPIRV1.5 tests on v9/v11; it is not a release claim. An
- * instance may enumerate an older physical device, so v7 remains1.1. */
+/* Normal builds retain the Vulkan 1.1 front end. The API lab enables the
+ * Vulkan 1.2 / SPIR-V 1.5 environment for qualification. The separate
+ * validation lab is also required to exercise Bifrost v7. */
 #ifndef UNIFIED_API12_LAB
 #define UNIFIED_API12_LAB 0
 #endif
+#ifndef UNIFIED_API13_LAB
+#define UNIFIED_API13_LAB 0
+#endif
+#ifndef UNIFIED_VALIDATION_LAB
+#define UNIFIED_VALIDATION_LAB 0
+#endif
 #define MALI_API_BASE_VERSION VK_MAKE_API_VERSION(0, 1, 1, VK_HEADER_VERSION)
-#define MALI_API_VERSION VK_MAKE_API_VERSION(0, 1, (UNIFIED_API12_LAB ? 2 : 1), VK_HEADER_VERSION)
+#define MALI_API_VERSION \
+   VK_MAKE_API_VERSION(0, 1, (UNIFIED_API13_LAB ? 3 : UNIFIED_API12_LAB ? 2 : 1), VK_HEADER_VERSION)
 
 static inline uint32_t
 mali_api_version_for_arch(uint32_t arch)
 {
-   return UNIFIED_API12_LAB && (arch == 9 || arch == 11) ?
+   return UNIFIED_API12_LAB &&
+          (arch == 9 || arch == 11 || (arch == 7 && UNIFIED_VALIDATION_LAB)) ?
       VK_MAKE_API_VERSION(0, 1, 2, VK_HEADER_VERSION) : MALI_API_BASE_VERSION;
 }
 
@@ -96,11 +104,9 @@ struct mali_physical_device {
    VkPhysicalDeviceMemoryProperties memory;
    uint64_t timestamp_hz;              /* 0: no timestamps */
 
-   /* VK_EXT_memory_budget's heapUsage: bytes in live VkDeviceMemory
-    * allocations on this physical device, summed across every VkDevice.
-    * Atomic: mali_AllocateMemory/mali_FreeMemory touch it without the
-    * device lock. */
-   uint64_t heap_used;
+   /* Bytes in live VkDeviceMemory allocations on this device node, summed
+    * across all VkDevices and VkInstances in the process. */
+   uint64_t *process_heap_used;
    /* The system's available memory for heapBudget, read from the kernel
     * at most once a second (mali_physical_device.c), and when it was read. */
    uint64_t avail_mem;
@@ -205,7 +211,7 @@ struct mali_meta_indirect_push {
  * the command buffer knows when it records the draw: where the draw's
  * parameters and the draw count are, and where in the draw's jobs and
  * descriptors each value that comes from them goes. Addresses that are 0
- * name nothing to patch. v9 uses the fields up to attr_stride.
+ * name nothing to patch. v9 uses the fields through attr_instance_limit.
  */
 #define MALI_IDRAW_MAX_ATTRIBS 16
 struct mali_jm_idraw_rec {
@@ -233,7 +239,9 @@ struct mali_jm_idraw_rec {
    uint32_t inst_attr_raw_mask;
    uint32_t attr_base[MALI_IDRAW_MAX_ATTRIBS];
    uint32_t attr_stride[MALI_IDRAW_MAX_ATTRIBS];
+   uint32_t attr_instance_limit[MALI_IDRAW_MAX_ATTRIBS];
    /* v7 */
+   uint32_t attr_word0[MALI_IDRAW_MAX_ATTRIBS];
    uint64_t minmax;         /* indexed: the smallest and largest index */
    uint64_t attrib_bufs;    /* the Attribute Buffer table, two per binding */
    uint32_t mod_mask;       /* bindings packed 1D Modulus (per vertex) */
@@ -286,6 +294,7 @@ struct mali_device_fault {
 
 struct mali_queue {
    struct vk_queue vk;
+   VkQueueGlobalPriority global_priority;
    /* Queue group, rings, submit state (mali_queue.h). */
    struct mali_csf_queue *csf;
    /* Job-manager submit state (mali_jm.h), on a v7 or v9 device instead. */
@@ -350,7 +359,7 @@ struct mali_device {
    pthread_mutex_t lock;
    pthread_cond_t cond;
    bool lost;
-   uint32_t lost_reported;        /* vk_device_set_lost called (atomic) */
+   uint32_t test_lose_on_event_status; /* atomic, written only by the validation build */
    /* What vkGetDeviceFaultInfoEXT reports, under lock: the message of the
     * first device loss and the first fault the kernel described. */
    char lost_msg[256];

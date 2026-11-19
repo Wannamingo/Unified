@@ -660,7 +660,7 @@ build_atom(struct mali_device *dev, enum mali_jm_atom_kind kind, uint8_t slot,
    a->udata[0] = b->seq;
    a->udata[1] = (udata1 & ~0xffull) | kind;
    a->atom_number = num;
-   a->prio = KB_JM_PRIO_MEDIUM;
+   a->prio = jd->queue->priority;
    a->core_req = core_req | (slot < MALI_JM_SLOT_COUNT ? KB_JM_REQ_EVENT_COALESCE : 0);
 
    struct mali_jm_atom_info *info = &jd->atoms[num];
@@ -1466,6 +1466,8 @@ MALI_PER_ARCH(queue_init)(struct mali_device *dev, struct mali_queue *queue)
    if (!q)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
    q->dev = dev;
+   q->priority = queue->global_priority == VK_QUEUE_GLOBAL_PRIORITY_LOW ?
+                    KB_JM_PRIO_LOW : KB_JM_PRIO_MEDIUM;
 
    pthread_mutex_lock(&dev->lock);
    jd->queue = q;

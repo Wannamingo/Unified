@@ -67,6 +67,7 @@ struct mali_preload_tracking {
    bool unknown;
    bool pending; /* a diagnostic LOAD invalidate is pending on F */
    struct mali_preload_stats stats;
+   struct mali_load_bins bins;
 };
 
 struct mali_cmd_cs {

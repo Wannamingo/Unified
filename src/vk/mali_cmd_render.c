@@ -150,12 +150,75 @@ classify_preloads(const struct mali_cmd_buffer *cmd)
    return PRELOAD_SKIP;
 }
 
+static bool
+zs_load_candidate(const struct mali_csf_device *csf, const struct mali_render_desc *d)
+{
+   if (!(csf->zs_load_elide || csf->preload_profile) || csf->tiler_ir)
+      return false;
+   if (d->blit || d->flags || d->view_mask || d->layer_count != 1 || d->samples != 1 ||
+       d->rt_count != 1 || !d->rt[0].image || d->rt[0].feedback_loop ||
+       d->resolve_z.image || d->resolve_s.image)
+      return false;
+   const struct mali_fb_target *z = &d->z, *s = &d->s;
+   return z->image && z->image == s->image &&
+          z->image->vk.format == VK_FORMAT_D24_UNORM_S8_UINT &&
+          z->plane != s->plane && z->level == s->level && z->layer == s->layer &&
+          !z->feedback_loop && !s->feedback_loop &&
+          ((z->load == MALI_ATT_LOAD_LOAD && z->store) ||
+           (s->load == MALI_ATT_LOAD_LOAD && s->store));
+}
+
 void
 MALI_PER_ARCH(cmd_render_begin)(struct mali_cmd_buffer *cmd, const struct mali_render_desc *desc)
 {
    const bool any_preload = MALI_PER_ARCH(fb_begin)(cmd, desc);
+   const struct mali_csf_device *csf = cmd->dev->csf;
+   struct mali_render_state *r = &cmd->gfx.render;
+   r->zs_load_candidate = zs_load_candidate(csf, &r->desc);
 
    if (any_preload) {
+      const unsigned f = MALI_SUBQUEUE_FRAGMENT;
+      const unsigned all = csf->sb.all_iters_mask;
+      unsigned wait = all;
+
+      if (csf->preload_track || csf->preload_stats) {
+         struct mali_preload_tracking *tracking = &cmd->gfx.preload;
+         const bool covered = (cmd->cs[f].pending_wait & all) == all;
+         if (csf->preload_stats) {
+            tracking->stats.candidates++;
+            tracking->pending = true;
+            tracking->stats.covered += covered;
+            tracking->stats.direct_waits += csf->preload_direct;
+         }
+         if (csf->preload_track && !covered) {
+            switch (classify_preloads(cmd)) {
+            case PRELOAD_SKIP:
+               wait = 0;
+               if (csf->preload_stats)
+                  tracking->stats.skipped++;
+               break;
+            case PRELOAD_UNKNOWN:
+               if (csf->preload_stats)
+                  tracking->stats.unknown++;
+               break;
+            case PRELOAD_OVERLAP:
+               if (csf->preload_stats)
+                  tracking->stats.overlap++;
+               break;
+            }
+         }
+      }
+
+      /* The implicit preload dependency is always F -> F. Its only
+       * cache operation is texture invalidation. The generic path folds
+       * its self-dependency into exactly these pending fields. No other
+       * subqueue waits for a signal, even if this pass keeps the full wait. */
+      if (csf->preload_direct) {
+         cmd->cs[f].pending_wait |= wait;
+         cmd->cs[f].pending_flush.others |= MALI_CS_OTHER_FLUSH_MODE_INVALIDATE;
+         return;
+      }
+
       /* Loads go through the texture unit: invalidate its caches after
        * earlier attachment writes (panvk cmd_init_render_state; the blob
        * sets r49 for the same invalidate). */
@@ -176,36 +239,9 @@ MALI_PER_ARCH(cmd_render_begin)(struct mali_cmd_buffer *cmd, const struct mali_r
       };
       struct mali_cs_deps deps = {0};
       mali_cmd_add_deps(cmd, &dep, &deps);
-      const struct mali_csf_device *csf = cmd->dev->csf;
-      const unsigned f = MALI_SUBQUEUE_FRAGMENT;
-      if (csf->preload_track || csf->preload_stats) {
-         struct mali_preload_tracking *tracking = &cmd->gfx.preload;
-         const unsigned all = csf->sb.all_iters_mask;
-         const bool covered = (cmd->cs[f].pending_wait & all) == all;
-         if (csf->preload_stats) {
-            tracking->stats.candidates++;
-            tracking->pending = true;
-            tracking->stats.covered += covered;
-         }
-         if (csf->preload_track && !covered) {
-            switch (classify_preloads(cmd)) {
-            case PRELOAD_SKIP:
-               /* Keep cache maintenance and any existing dependencies. */
-               deps.src[f].wait_sb_mask &= ~all;
-               deps.dst[f].wait_subqueue_mask &= ~BITFIELD_BIT(f);
-               if (csf->preload_stats)
-                  tracking->stats.skipped++;
-               break;
-            case PRELOAD_UNKNOWN:
-               if (csf->preload_stats)
-                  tracking->stats.unknown++;
-               break;
-            case PRELOAD_OVERLAP:
-               if (csf->preload_stats)
-                  tracking->stats.overlap++;
-               break;
-            }
-         }
+      if (!wait) {
+         deps.src[f].wait_sb_mask &= ~all;
+         deps.dst[f].wait_subqueue_mask &= ~BITFIELD_BIT(f);
       }
       mali_cmd_emit_barrier(cmd, &deps);
    }
@@ -576,6 +612,125 @@ issue_fragment_jobs(struct mali_cmd_buffer *cmd, struct mali_render_state *r,
    cs_set_state(b, MALI_CS_SET_STATE_TYPE_SB_MASK_STREAM, sb_mask);
 }
 
+static void
+elide_unused_zs_loads(struct mali_cmd_buffer *cmd, struct mali_render_state *r)
+{
+   if (!r->zs_load_candidate)
+      return;
+
+   struct mali_render_desc *d = &r->desc;
+   const bool profile = cmd->dev->csf->preload_profile;
+   struct mali_zs_load_stats *stats =
+      &cmd->gfx.preload.stats.zs[d->width == 1280 && d->height == 960];
+   if (profile)
+      stats->passes++;
+   /* Clears in the middle of a pass and any unclassified internal draw
+    * keep both planes. A pass with no raster draws isn't optimized. */
+   if (!r->draws || r->draws != r->zs_checked_draws ||
+       d->flags || r->suspended || r->ir_arm) {
+      if (profile)
+         stats->untracked++;
+      return;
+   }
+
+   const bool depth_unused = !(r->zs_used & VK_IMAGE_ASPECT_DEPTH_BIT) &&
+                             d->z.load == MALI_ATT_LOAD_LOAD && d->z.store;
+   const bool stencil_unused = !(r->zs_used & VK_IMAGE_ASPECT_STENCIL_BIT) &&
+                               d->s.load == MALI_ATT_LOAD_LOAD && d->s.store;
+   const bool opt = cmd->dev->csf->zs_load_elide;
+   if (profile) {
+      stats->depth_unused += depth_unused;
+      stats->stencil_unused += stencil_unused;
+      stats->depth_elided += opt && depth_unused;
+      stats->stencil_elided += opt && stencil_unused;
+   }
+
+   /* Keep the bindings for render state and dependency tracking. Do not
+    * copy the plane into the tile buffer or write anything back to it. */
+   if (opt && depth_unused)
+      d->z.preload = d->z.store = false;
+   if (opt && stencil_unused)
+      d->s.preload = d->s.store = false;
+}
+
+static void
+measure_pass_info(struct mali_cmd_buffer *cmd, const struct mali_render_state *r)
+{
+   const struct mali_render_desc *d = &r->desc;
+   const struct mali_fb_target *targets[] = { &d->rt[0], &d->z, &d->s };
+   uint32_t info = 0;
+   for (unsigned i = 0; i < ARRAY_SIZE(targets); i++) {
+      const struct mali_fb_target *t = targets[i];
+      if (t->image) {
+         info |= (uint32_t)t->preload << i;
+         info |= (uint32_t)t->store << (3 + i);
+      }
+   }
+   const struct mali_image *color = d->rt[0].image;
+   if (color) {
+      info |= (uint32_t)(color->wsi_mem != NULL || color->wsi_scanout) << 6;
+      info |= (uint32_t)mali_image_is_afbc(color) << 7;
+   }
+   if (d->blit) {
+      const struct mali_meta_fs_key *key = d->blit->key;
+      info |= (uint32_t)key->rt_op[0] << 8;
+      info |= (uint32_t)key->z_op << 12;
+      info |= (uint32_t)key->s_op << 16;
+   }
+   if (r->draws == 1) {
+      mali_measure_shader(cmd, r->measure_frag, r->measure_single_fs);
+      info |= MIN2(r->measure_single_vertices, 0xfffu) << 20;
+   }
+   mali_measure_extra(cmd, r->measure_frag, info);
+}
+
+static void
+record_attachment_stats(struct mali_cmd_buffer *cmd)
+{
+   const struct mali_render_desc *d = &cmd->gfx.render.desc;
+   struct mali_preload_stats *stats = &cmd->gfx.preload.stats;
+   const struct mali_fb_target *targets[10] = {&d->z, &d->s};
+   bool feedback = false, afbc = false;
+   struct mali_load_bin sample = {
+      .key = {
+         .width = d->width, .height = d->height,
+         .color_format = d->rt_count ? d->rt[0].format : PIPE_FORMAT_NONE,
+         .depth_format = d->z.format, .stencil_format = d->s.format,
+         .samples = d->samples, .meta = d->blit != NULL,
+      },
+      .passes = 1, .draws = cmd->gfx.render.draws,
+   };
+   for (unsigned i = 0; i < d->rt_count; i++)
+      targets[i + 2] = &d->rt[i];
+   for (unsigned i = 0; i < d->rt_count + 2; i++) {
+      const struct mali_fb_target *t = targets[i];
+      if (!t->image)
+         continue;
+      const bool loads = t->load == MALI_ATT_LOAD_LOAD && t->preload;
+      stats->attachment_loads += loads;
+      stats->attachment_preloads += t->preload;
+      if (loads) {
+         sample.loads++;
+         if (i == 0)
+            sample.key.depth_load = 1;
+         else if (i == 1)
+            sample.key.stencil_load = 1;
+         else
+            sample.key.color_loads++;
+      }
+      feedback |= t->feedback_loop;
+      afbc |= t->feedback_loop && mali_image_is_afbc(t->image);
+   }
+   stats->feedback_passes += feedback;
+   stats->feedback_afbc_passes += afbc;
+   if (cmd->dev->csf->preload_profile && sample.loads) {
+      const uint32_t layers = d->view_mask ? util_bitcount(d->view_mask) : d->layer_count;
+      sample.area_loads = (uint64_t)d->area.extent.width * d->area.extent.height *
+                          MAX2(layers, 1) * sample.loads;
+      mali_load_bin_add(&cmd->gfx.preload.bins, &sample);
+   }
+}
+
 void
 MALI_PER_ARCH(cmd_render_end)(struct mali_cmd_buffer *cmd)
 {
@@ -584,6 +739,7 @@ MALI_PER_ARCH(cmd_render_end)(struct mali_cmd_buffer *cmd)
       return;
 
    if (MALI_PER_ARCH(fb_pass_has_work)(r) && !vk_command_buffer_has_error(&cmd->vk)) {
+      elide_unused_zs_loads(cmd, r);
       bool ok = mali_fb_alloc_tsd(cmd, r);
       uint32_t fbd_sz = 0;
       r->ir_descriptors = r->ir_arm && mali_tiler_ir_eligible(r);
@@ -599,6 +755,8 @@ MALI_PER_ARCH(cmd_render_end)(struct mali_cmd_buffer *cmd)
          if (unlikely(r->measure_vt))
             mali_measure_end(cmd, r->measure_vt);
          issue_fragment_jobs(cmd, r, fbds, fbd_sz);
+         if (unlikely(cmd->dev->csf->preload_stats))
+            record_attachment_stats(cmd);
       }
    }
    if (!vk_command_buffer_has_error(&cmd->vk))
@@ -607,6 +765,8 @@ MALI_PER_ARCH(cmd_render_end)(struct mali_cmd_buffer *cmd)
       const uint32_t w = r->desc.width, h = r->desc.height;
       mali_measure_info(cmd, r->measure_vt, w, h, r->desc.rt_count, r->draws);
       mali_measure_info(cmd, r->measure_frag, w, h, r->desc.rt_count, r->draws);
+      if (cmd->measure->m->cfg.passinfo)
+         measure_pass_info(cmd, r);
    }
 
    r->active = false;

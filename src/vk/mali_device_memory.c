@@ -316,7 +316,7 @@ out:
 
    /* VK_EXT_memory_budget's heapUsage: the kbase region's real size (page
     * rounded), not the requested size. */
-   p_atomic_add(&pdev->heap_used, (int64_t)mem->bo.size);
+   p_atomic_add(pdev->process_heap_used, (int64_t)mem->bo.size);
 
    *pMem = mali_device_memory_to_handle(mem);
    return VK_SUCCESS;
@@ -365,7 +365,7 @@ mali_FreeMemory(VkDevice _device, VkDeviceMemory _mem,
    if (!mem)
       return;
 
-   p_atomic_add(&mali_device_physical(dev)->heap_used, -(int64_t)mem->bo.size);
+   p_atomic_add(mali_device_physical(dev)->process_heap_used, -(int64_t)mem->bo.size);
 
    if (mem->dmabuf_fd >= 0) {
       if (mem->map)

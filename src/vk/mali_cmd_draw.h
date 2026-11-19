@@ -20,6 +20,7 @@
 #define MALI_CMD_DRAW_H
 
 #include "mali_cmd_state.h"
+#include "mali_measure.h"
 
 #if PAN_ARCH != 11
 #error "mali_cmd_draw.h is written for arch v11"
@@ -291,6 +292,26 @@ prepare_draw(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, struc
 
    if (!mali_gfx_update_dirty(cmd, di, &dbk))
       return false;
+
+   if (unlikely(cmd->measure) && cmd->measure->m->cfg.passinfo && !r->draws) {
+      if (p->fs)
+         memcpy(&r->measure_single_fs, p->fs->key, sizeof(r->measure_single_fs));
+      r->measure_single_vertices = di->count;
+   }
+
+   if (unlikely(r->zs_load_candidate)) {
+      r->zs_checked_draws++;
+      if (p->sampled_feedback_loop || (p->fs && p->fs->fs.input_attachment_read)) {
+         r->zs_used |= VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+      } else {
+         const struct vk_depth_stencil_state *ds = dbk ? &dyn->ds : &p->state.ds;
+         if (ds->depth.test_enable || ds->depth.bounds_test.enable ||
+             (p->fs && p->fs->info.fs.writes_depth))
+            r->zs_used |= VK_IMAGE_ASPECT_DEPTH_BIT;
+         if (ds->stencil.test_enable || (p->fs && p->fs->info.fs.writes_stencil))
+            r->zs_used |= VK_IMAGE_ASPECT_STENCIL_BIT;
+      }
+   }
 
    if (cmd->dev->csf->preload_track && p->fs && p->fs->info.writes_global)
       r->fragment_writes_global = true;

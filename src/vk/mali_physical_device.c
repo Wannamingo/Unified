@@ -17,8 +17,12 @@
 #include "mali_shader.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
 
 #include "util/log.h"
 #include "util/macros.h"
@@ -332,6 +336,11 @@ available_memory(struct mali_physical_device *pdev)
  */
 static const struct vk_device_extension_table mali_device_extensions = {
    .KHR_driver_properties = true,
+   .KHR_map_memory2 = true,
+   .KHR_global_priority = true,
+   .KHR_maintenance5 = UNIFIED_VALIDATION_LAB,
+   .KHR_maintenance6 = true,
+   .EXT_pipeline_robustness = UNIFIED_VALIDATION_LAB,
    .KHR_vertex_attribute_divisor = true,
    /* Sync-file import and export: the Android loader signals present
     * fences by importing the release fence (swapchain_maintenance1). */
@@ -507,6 +516,52 @@ int8_for_arch(uint32_t arch)          /* shaderInt8 of VK_KHR_shader_float16_int
    return arch == 7 || arch == 9 || arch == 11;
 }
 
+static bool
+separate_depth_stencil_layouts_for_arch(uint32_t arch)
+{
+   /* The render-pass runtime emits per-aspect barriers, and depth and
+    * stencil are stored in independent planes on all three architectures. */
+   return arch == 9 || arch == 11 || (arch == 7 && UNIFIED_VALIDATION_LAB);
+}
+
+static bool
+subgroup_extended_types_for_arch(uint32_t arch)
+{
+   /* NIR scalarizes narrow vectors and lowers reductions and scans. The
+    * Bifrost and Valhall backends implement the indexed lane read (CLPER).
+    * The exposed narrow arithmetic types are int8 and int16. */
+   return arch == 9 || arch == 11 || (arch == 7 && UNIFIED_VALIDATION_LAB);
+}
+
+static VkSubgroupFeatureFlags
+subgroup_operations_for_arch(uint32_t arch)
+{
+   VkSubgroupFeatureFlags ops = VK_SUBGROUP_FEATURE_BASIC_BIT;
+   if (subgroup_extended_types_for_arch(arch)) {
+      ops |= VK_SUBGROUP_FEATURE_ARITHMETIC_BIT |
+             VK_SUBGROUP_FEATURE_BALLOT_BIT |
+             VK_SUBGROUP_FEATURE_SHUFFLE_BIT |
+             VK_SUBGROUP_FEATURE_QUAD_BIT;
+   }
+   if (arch == 9 || arch == 11) {
+      ops |= VK_SUBGROUP_FEATURE_VOTE_BIT |
+             VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT |
+             VK_SUBGROUP_FEATURE_CLUSTERED_BIT |
+             VK_SUBGROUP_FEATURE_ROTATE_BIT_KHR |
+             VK_SUBGROUP_FEATURE_ROTATE_CLUSTERED_BIT_KHR;
+   }
+   return ops;
+}
+
+static bool
+subgroup_size_control_for_arch(uint32_t arch)
+{
+   /* Bifrost compute runs fixed eight-lane subgroups without workgroup
+    * merging. Valhall supports the existing fixed sixteen-lane contract. */
+   return arch == 9 || arch == 11 ||
+          (arch == 7 && UNIFIED_API12_LAB && UNIFIED_VALIDATION_LAB);
+}
+
 /*
  * Indirect draws with more than one command (multiDrawIndirect), a first
  * instance taken from the command (drawIndirectFirstInstance), and the
@@ -533,74 +588,127 @@ max_draw_indirect_count_for_arch(uint32_t arch)
    return arch == 11 ? INT32_MAX : UINT16_MAX;
 }
 
-/* Shared memory is explicitly lowered and zeroed by nir_zero_initialize_shared_memory.
- * Keep v7 unadvertised until its separate hardware path is qualified. */
+/* The shared-memory lowering emits cooperative stores followed by a
+ * workgroup barrier before the original shader body. */
 static bool
 workgroup_zero_init_for_arch(uint32_t arch)
 {
-   return arch == 9 || arch == 11;
+   return arch == 9 || arch == 11 || (arch == 7 && UNIFIED_VALIDATION_LAB);
 }
 
-/* Real buffer VA getter and physical64bit global lowering already exist.
- * Admit the application-facing extension only on the tested-family candidate;
- * capture/replay and multiple physical devices remain unsupported. */
 static bool
-basic_buffer_device_address_for_arch(uint32_t arch)
+shader_terminate_invocation_for_arch(uint32_t arch)
 {
-   return arch == 9 || arch == 11;
+   /* Panfrost lowers termination to demote followed by a real halt.
+    * Bifrost lowers the resulting shader exits before emitting ISA. */
+   return arch == 9 || arch == 11 || (arch == 7 && UNIFIED_VALIDATION_LAB);
+}
+
+static bool
+vulkan13_shader_and_resource_features_for_arch(uint32_t arch)
+{
+   /* The G52 test configuration uses the Bifrost compiler and real JM
+    * memory/descriptor paths. Keep it behind both validation options. */
+   return arch == 9 || arch == 11 ||
+          (arch == 7 && UNIFIED_API12_LAB && UNIFIED_VALIDATION_LAB);
+}
+
+static bool
+shader_float_controls2_lab_for_arch(uint32_t arch)
+{
+   /* The SPIR-V frontend and the Panfrost optimizer share the fast-math
+    * controls on Bifrost and Valhall. Qualify the backend in the core lab. */
+   return UNIFIED_API13_LAB && UNIFIED_VALIDATION_LAB &&
+          (arch == 7 || arch == 9 || arch == 11);
+}
+
+static bool
+shader_expect_assume_for_arch(uint32_t arch)
+{
+   /* VTN forwards the value of OpExpectKHR and treats OpAssumeTrueKHR
+    * as an optional optimization hint for every backend. */
+   return arch == 9 || arch == 11 ||
+          (arch == 7 && UNIFIED_API13_LAB && UNIFIED_VALIDATION_LAB);
+}
+
+static bool
+variable_pointers_lab_for_arch(uint32_t arch)
+{
+   /* VTN represents variable pointers with the same address formats as
+    * explicit UBO/SSBO addressing. Keep the JM and CSF paths in the lab
+    * until they are exercised with both bounded and unrestricted pointers. */
+   return UNIFIED_API13_LAB && UNIFIED_VALIDATION_LAB &&
+          (arch == 7 || arch == 9 || arch == 11);
+}
+
+static bool
+sampler_and_buffer_layout_for_arch(uint32_t arch)
+{
+   /* v7 has the mirrored clamp sampler encoding and explicit byte
+    * offsets in buffer shaders. Qualify both paths with the core lab. */
+   return arch == 9 || arch == 11 ||
+          (arch == 7 && UNIFIED_API13_LAB && UNIFIED_VALIDATION_LAB);
+}
+
+static bool
+attachment_feedback_loop_lab(uint32_t arch)
+{
+   if (!UNIFIED_VALIDATION_LAB || arch != 11)
+      return false;
+
+   const char *value = getenv("UNIFIED_FEEDBACK_LOOP");
+#ifdef __ANDROID__
+   char property[PROP_VALUE_MAX];
+   if (!value && __system_property_get("debug.unified.feedback_loop", property) > 0)
+      value = property;
+#endif
+   return value && strcmp(value, "1") == 0;
 }
 
 static struct vk_device_extension_table
 device_extensions_for_arch(uint32_t arch)
 {
    struct vk_device_extension_table ext = mali_device_extensions;
+   const bool shader_resources = vulkan13_shader_and_resource_features_for_arch(arch);
    /* Existing VTN + Bifrost NIR subgroup lowering produces ballot and
     * read_invocation operations handled by Kraid on these generations.
     * Leave v7 unchanged pending independent native qualification. */
    ext.KHR_shader_subgroup_rotate = arch == 9 || arch == 11;
-   /* VTN implements Expect as an identity copy and ignores valid AssumeTrue
-    * optimization hints. No new ISA support is required. Qualify the real
-    * scalar/vector int/uint/bool shader path before wider arch admission. */
-   ext.KHR_shader_expect_assume = arch == 9 || arch == 11;
-   /* The per-arch sampler packer has the real mirrored-once clamp mode.
-    * Keep admission limited to v9/v11 pending normalized sampling tests.
-    * This extension is legal below core1.2 and has no feature struct. */
-   ext.KHR_sampler_mirror_clamp_to_edge = arch == 9 || arch == 11;
-   /* Explicit SPIR-V member offsets/array strides already reach byte-addressed
-    * UBO/SSBO/push loads and stores. Valhall permits unaligned accesses.
-    * Candidate only: require real packed-layout native qualification on v9/v11;
-    * do not widen v7 or promote the advertised Vulkan API. */
-   ext.EXT_scalar_block_layout = arch == 9 || arch == 11;
-   ext.KHR_shader_subgroup_extended_types = arch == 9 || arch == 11;
+   ext.KHR_shader_expect_assume = shader_expect_assume_for_arch(arch);
+   ext.KHR_shader_float_controls2 = shader_float_controls2_lab_for_arch(arch);
+   ext.KHR_variable_pointers = variable_pointers_lab_for_arch(arch);
+   ext.KHR_sampler_mirror_clamp_to_edge = sampler_and_buffer_layout_for_arch(arch);
+   ext.EXT_scalar_block_layout = sampler_and_buffer_layout_for_arch(arch);
+   ext.KHR_shader_subgroup_extended_types = subgroup_extended_types_for_arch(arch);
    ext.EXT_host_query_reset = arch == 7 || arch == 9 || arch == 11;
    ext.EXT_vertex_attribute_divisor = arch == 11;
    ext.EXT_host_image_copy = mali_host_copy_enabled(arch);
    ext.KHR_sampler_ycbcr_conversion = mali_ycbcr_enabled(arch);
-   ext.KHR_uniform_buffer_standard_layout = arch == 9 || arch == 11;
-   ext.KHR_separate_depth_stencil_layouts = arch == 9 || arch == 11;
+   ext.KHR_uniform_buffer_standard_layout = arch == 9 || arch == 11 || UNIFIED_VALIDATION_LAB;
+   ext.KHR_separate_depth_stencil_layouts = separate_depth_stencil_layouts_for_arch(arch);
    ext.KHR_zero_initialize_workgroup_memory = workgroup_zero_init_for_arch(arch);
-   ext.KHR_buffer_device_address = basic_buffer_device_address_for_arch(arch);
+   ext.KHR_buffer_device_address = shader_resources;
    /* All six per-arch handlers are real. The formerly missing 3D Z blit
     * path was implemented and qualified separately before this admission.
     * Keep v7 unadvertised until its own native qualification. */
    ext.KHR_copy_commands2 = arch == 9 || arch == 11;
-   ext.KHR_maintenance4 = arch == 9 || arch == 11;
-   ext.KHR_shader_terminate_invocation = arch == 9 || arch == 11;
-   /* Basic image robustness candidate; v7 is not qualified. */
-   ext.EXT_image_robustness = arch == 9 || arch == 11;
+   ext.KHR_maintenance4 = arch == 9 || arch == 11 || UNIFIED_VALIDATION_LAB;
+   ext.KHR_shader_terminate_invocation = shader_terminate_invocation_for_arch(arch);
+   ext.EXT_image_robustness = shader_resources;
    ext.KHR_format_feature_flags2 = arch == 9 || arch == 11;
-   ext.EXT_inline_uniform_block = arch == 9 || arch == 11;
-   ext.KHR_shader_integer_dot_product = arch == 9 || arch == 11;
-   ext.EXT_subgroup_size_control = arch == 9 || arch == 11;
-   ext.KHR_imageless_framebuffer = arch == 9 || arch == 11;
-   ext.KHR_vulkan_memory_model = arch == 9 || arch == 11;
-   ext.KHR_index_type_uint8 = arch == 9 || arch == 11;
-   ext.EXT_index_type_uint8 = arch == 9 || arch == 11;
+   ext.EXT_inline_uniform_block = shader_resources;
+   ext.KHR_shader_integer_dot_product = shader_resources;
+   ext.EXT_subgroup_size_control = subgroup_size_control_for_arch(arch);
+   ext.KHR_imageless_framebuffer = arch == 9 || arch == 11 || UNIFIED_VALIDATION_LAB;
+   ext.KHR_vulkan_memory_model = shader_resources;
+   ext.KHR_shader_draw_parameters = arch == 7;
+   ext.KHR_index_type_uint8 = arch == 7 || arch == 9 || arch == 11;
+   ext.EXT_index_type_uint8 = ext.KHR_index_type_uint8;
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
    /* The static image-format-list entry above belongs to the Linux WSI
     * #else branch. Imageless on Android needs this dependency too; the
     * common image/runtime already consumes format-list metadata. */
-   ext.KHR_image_format_list = arch == 9 || arch == 11;
+   ext.KHR_image_format_list = ext.KHR_imageless_framebuffer;
 #endif
 
    ext.KHR_draw_indirect_count = draw_indirect_for_arch(arch);
@@ -731,6 +839,8 @@ get_descriptor_indexing_features(struct vk_features *f, uint32_t arch)
 static void
 get_features(struct vk_features *f, uint32_t arch)
 {
+   const bool shader_resources = vulkan13_shader_and_resource_features_for_arch(arch);
+
    *f = (struct vk_features) {
       /* Vulkan 1.0 */
       .robustBufferAccess = true,
@@ -796,6 +906,8 @@ get_features(struct vk_features *f, uint32_t arch)
 
       /* Vulkan 1.1: multiview is required of a 1.1 device. */
       .multiview = true,
+      .variablePointersStorageBuffer = variable_pointers_lab_for_arch(arch),
+      .variablePointers = variable_pointers_lab_for_arch(arch),
 
       /* VK_EXT_rasterization_order_attachment_access, every arch: the
        * draw descriptor's Flags 0 word (mali_pipeline_state.c) carries
@@ -859,55 +971,50 @@ get_features(struct vk_features *f, uint32_t arch)
        * byte-addressed loads. Descriptor lowering does not replace them
        * with std140 padding; the FS FAU path also retains byte offsets.
        * Native regular/dynamic dense-layout qualification is separate. */
-      .uniformBufferStandardLayout = arch == 9 || arch == 11,
-      /* The common render-pass runtime keeps per-aspect layouts and emits
-       * single-aspect barriers. Our DS planes and framebuffer load/store
-       * targets are independent; DS layouts need no AFBC/CRC conversion.
-       * Qualify separate depth/stencil preservation on v9/v11 first. */
-      .separateDepthStencilLayouts = arch == 9 || arch == 11,
+      .uniformBufferStandardLayout = arch == 9 || arch == 11 || UNIFIED_VALIDATION_LAB,
+      .separateDepthStencilLayouts = separate_depth_stencil_layouts_for_arch(arch),
       .shaderZeroInitializeWorkgroupMemory = workgroup_zero_init_for_arch(arch),
-      .maintenance4 = arch == 9 || arch == 11,
-      .shaderTerminateInvocation = arch == 9 || arch == 11,
-      .robustImageAccess = arch == 9 || arch == 11,
-      .inlineUniformBlock = arch == 9 || arch == 11,
-      .shaderIntegerDotProduct = arch == 9 || arch == 11,
-      .subgroupSizeControl = arch == 9 || arch == 11,
-      .computeFullSubgroups = arch == 9 || arch == 11,
+      .maintenance4 = arch == 9 || arch == 11 || UNIFIED_VALIDATION_LAB,
+      .maintenance5 = UNIFIED_VALIDATION_LAB,
+      .maintenance6 = true,
+      .globalPriorityQuery = true,
+      .pipelineRobustness = UNIFIED_VALIDATION_LAB,
+      .shaderTerminateInvocation = shader_terminate_invocation_for_arch(arch),
+      .robustImageAccess = shader_resources,
+      .inlineUniformBlock = shader_resources,
+      .shaderIntegerDotProduct = shader_resources,
+      .subgroupSizeControl = subgroup_size_control_for_arch(arch),
+      .computeFullSubgroups = subgroup_size_control_for_arch(arch),
       .shaderSubgroupRotate = arch == 9 || arch == 11,
       .shaderSubgroupRotateClustered = arch == 9 || arch == 11,
-      .shaderExpectAssume = arch == 9 || arch == 11,
-      .samplerMirrorClampToEdge = arch == 9 || arch == 11,
-      .scalarBlockLayout = arch == 9 || arch == 11,
-      /* The advertised arithmetic types are int8/int16, not float16
-       * or int64. Shared NIR subgroup lowering scalarizes vectors
-       * and reductions/scans, then widens narrow read_invocation
-       * to the 32-bit CLPER operation Kraid implements. This is an
-       * experimental admission pending real typed GPU qualification. */
-      .shaderSubgroupExtendedTypes = arch == 9 || arch == 11,
-      /* Existing common subgroup lowering maps dynamic Broadcast/Quad to
-       * indexed CLPER reads on these arches. Only the private1.2 lab
-       * admits the SPIRV1.5 environment for its pending native tests. */
-      .subgroupBroadcastDynamicId = UNIFIED_API12_LAB && (arch == 9 || arch == 11),
+      .shaderExpectAssume = shader_expect_assume_for_arch(arch),
+      .shaderFloatControls2 = shader_float_controls2_lab_for_arch(arch),
+      .samplerMirrorClampToEdge = sampler_and_buffer_layout_for_arch(arch),
+      .scalarBlockLayout = sampler_and_buffer_layout_for_arch(arch),
+      .shaderSubgroupExtendedTypes = subgroup_extended_types_for_arch(arch),
+      /* Dynamic Broadcast and QuadBroadcast use indexed lane reads.
+       * This feature requires the SPIR-V 1.5 validation environment. */
+      .subgroupBroadcastDynamicId =
+         VK_API_VERSION_MINOR(mali_api_version_for_arch(arch)) >= 2,
       /* The extension's existing children/limits remain unchanged. The
        * Vulkan1.2 umbrella must accompany them in that core environment. */
       .descriptorIndexing = UNIFIED_API12_LAB && (arch == 9 || arch == 11),
       /* Mesa common framebuffer creation stores metadata without image views;
        * its render-pass begin path resolves the supplied late attachments. */
-      .imagelessFramebuffer = arch == 9 || arch == 11,
+      .imagelessFramebuffer = arch == 9 || arch == 11 || UNIFIED_VALIDATION_LAB,
       /* The existing binding path maps UINT8 to one-byte elements. Both
        * direct job/IDVS emission and indirect patching carry that size.
        * Admit only v9/v11 after bounded direct/restart/indirect tests. */
-      .indexTypeUint8 = arch == 9 || arch == 11,
-      /* VTN's Vulkan memory model feeds the existing scoped NIR barriers.
-       * Kraid prevents message motion across scheduling barriers and drains
-       * message slots before workgroup barriers. Qualify the real paths on
-       * v9/v11 before widening the admission to other architectures. */
-      .vulkanMemoryModel = arch == 9 || arch == 11,
-      .vulkanMemoryModelDeviceScope = arch == 9 || arch == 11,
+      .shaderDrawParameters = arch == 7,
+      .indexTypeUint8 = arch == 7 || arch == 9 || arch == 11,
+      /* VTN translates availability/visibility and ordered atomics to
+       * scoped NIR barriers. Both backends lower these barriers. */
+      .vulkanMemoryModel = shader_resources,
+      .vulkanMemoryModelDeviceScope = shader_resources,
       /* Multi-element availability/visibility chains need separate proof. */
       .vulkanMemoryModelAvailabilityVisibilityChains = false,
       .descriptorBindingInlineUniformBlockUpdateAfterBind = arch == 9 || arch == 11,
-      .bufferDeviceAddress = basic_buffer_device_address_for_arch(arch),
+      .bufferDeviceAddress = shader_resources,
       .bufferDeviceAddressCaptureReplay = false,
       .bufferDeviceAddressMultiDevice = false,
       .shaderDemoteToHelperInvocation = true,
@@ -926,9 +1033,8 @@ get_features(struct vk_features *f, uint32_t arch)
    get_descriptor_indexing_features(f, arch);
 }
 
-/* Candidate color and selected depth/stencil MSAA1|4 onv9/v11.
- * DS sample-zero resolve has dedicated native acceptance pending; other DS
- * formats and v7 stay1x. No full Vulkan core-conformance claim. */
+/* Color and selected depth/stencil formats support the 1x and 4x
+ * framebuffer paths. G52 is enabled in the isolated Vulkan 1.2 build. */
 #define MALI_SUPPORTED_SAMPLE_COUNTS (VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT)
 
 /* Sample counts for a format of the given bytes per pixel: 1 and 4
@@ -977,7 +1083,9 @@ VkSampleCountFlags
 mali_physical_device_sample_counts(const struct mali_physical_device *pdev,
                                    unsigned bytes_per_pixel)
 {
-   if (pdev->props.arch_major != 9 && pdev->props.arch_major != 11)
+   const unsigned arch = pdev->props.arch_major;
+   if (arch != 9 && arch != 11 &&
+       !(arch == 7 && UNIFIED_API12_LAB && UNIFIED_VALIDATION_LAB))
       return VK_SAMPLE_COUNT_1_BIT;
    return sample_counts(bytes_per_pixel, tilebuf_budget(&pdev->props));
 }
@@ -1020,7 +1128,11 @@ pipeline_cache_uuid(uint8_t out[VK_UUID_SIZE], const char *cache_id, size_t cach
    _mesa_blake3_update(&ctx, &gpu_id, sizeof(gpu_id));
 #if UNIFIED_API12_LAB
    /* Never mix private-lab pipeline data with a normal driver's cache. */
+#if UNIFIED_API13_LAB
+   static const char lab_domain[] = "Unified-API13-lab-v1";
+#else
    static const char lab_domain[] = "Unified-API12-lab-v1";
+#endif
    _mesa_blake3_update(&ctx, lab_domain, sizeof(lab_domain));
 #endif
 
@@ -1029,19 +1141,44 @@ pipeline_cache_uuid(uint8_t out[VK_UUID_SIZE], const char *cache_id, size_t cach
    memcpy(out, h, VK_UUID_SIZE);
 }
 
+static bool
+vulkan13_lab_for_gpu(const struct mali_kbase_gpu_props *p)
+{
+   if (!UNIFIED_API13_LAB)
+      return false;
+
+   switch (p->product_id & 0xf00f) {
+   case 0x7002: /* G52 */
+   case 0x9001: /* G57 */
+   case 0x9003: /* G57 */
+   case 0xb003: /* G615 */
+      return true;
+   case 0xb002: /* G615-branded variant of the G715 */
+      return p->core_count > 0 && p->core_count < 7;
+   default:
+      return false;
+   }
+}
+
 static void
 get_properties(const struct mali_physical_device *pdev, const char *name,
                struct vk_properties *props)
 {
    const struct mali_kbase_gpu_props *p = &pdev->props;
-   const VkSampleCountFlags samples = p->arch_major == 9 || p->arch_major == 11 ?
-      sample_counts(4, tilebuf_budget(p)) : VK_SAMPLE_COUNT_1_BIT;
+   const VkSampleCountFlags samples = mali_physical_device_sample_counts(pdev, 4);
+   const bool core13 = vulkan13_lab_for_gpu(p);
+   /* Keep the existing byte-aligned view contract. Neither texel descriptor
+    * path promises tighter, format-specific single-texel alignment. */
+   const VkDeviceSize texel_buffer_alignment = 64;
 
    /* min(max_workgroup_size, max_barrier_size); 1024 on the device.
     * Fall back to Vulkan's minimum if the kernel did not say. */
    uint32_t wg = MIN2(p->max_workgroup_size, p->max_barrier_size);
    if (!wg)
       wg = 128;
+   const uint32_t subgroup_size = pan_subgroup_size(pdev->arch);
+   const bool subgroup_control = subgroup_size_control_for_arch(pdev->arch);
+   const bool inline_uniform = vulkan13_shader_and_resource_features_for_arch(pdev->arch);
 
    const uint64_t max_alloc = MIN2(heap_size(p), 8ull << 30);
    const float ts_period = pdev->timestamp_hz ? 1e9f / (float)pdev->timestamp_hz : 1.0f;
@@ -1051,7 +1188,7 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
    const char *const driver_info = driver_info_for_arch(p->arch_major);
 
    *props = (struct vk_properties) {
-      .apiVersion = mali_api_version_for_arch(p->arch_major),
+      .apiVersion = core13 ? MALI_API_VERSION : mali_api_version_for_arch(p->arch_major),
       .driverVersion = driver_version,
       .vendorID = MALI_VENDOR_ID,
       .deviceID = (uint32_t)p->gpu_id,
@@ -1088,7 +1225,9 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       .viewportBoundsRange = { -32768.0f, 32767.0f },
       .viewportSubPixelBits = 0,
       .minMemoryMapAlignment = 64,
-      .minTexelBufferOffsetAlignment = 64,
+      .minTexelBufferOffsetAlignment = texel_buffer_alignment,
+      .storageTexelBufferOffsetAlignmentBytes = core13 ? texel_buffer_alignment : 0,
+      .uniformTexelBufferOffsetAlignmentBytes = core13 ? texel_buffer_alignment : 0,
       .minUniformBufferOffsetAlignment = 16,
       .minStorageBufferOffsetAlignment = 64,
       .minTexelOffset = -8,
@@ -1102,6 +1241,7 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       .maxFramebufferHeight = 16384,
       .maxFramebufferLayers = 256,
       .framebufferColorSampleCounts = samples,
+      .framebufferIntegerColorSampleCounts = VK_SAMPLE_COUNT_1_BIT,
       .framebufferDepthSampleCounts = samples,
       .framebufferStencilSampleCounts = samples,
       .framebufferNoAttachmentsSampleCounts = samples,
@@ -1142,12 +1282,15 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       /* VK_KHR_push_descriptor. panvk's value; ARMSX2 needs 7 (its TFX
        * texture set). */
       .maxPushDescriptors = 32,
-      .maxInlineUniformBlockSize = pdev->arch == 7 ? 0 : MALI_MAX_INLINE_UNIFORM_BLOCK_SIZE,
-      .maxPerStageDescriptorInlineUniformBlocks = pdev->arch == 7 ? 0 : MALI_MAX_INLINE_UNIFORM_BLOCK_BINDINGS,
-      .maxPerStageDescriptorUpdateAfterBindInlineUniformBlocks = pdev->arch == 7 ? 0 : MALI_MAX_INLINE_UNIFORM_BLOCK_BINDINGS,
-      .maxDescriptorSetInlineUniformBlocks = pdev->arch == 7 ? 0 : MALI_MAX_INLINE_UNIFORM_BLOCK_BINDINGS,
-      .maxDescriptorSetUpdateAfterBindInlineUniformBlocks = pdev->arch == 7 ? 0 : MALI_MAX_INLINE_UNIFORM_BLOCK_BINDINGS,
-      .maxInlineUniformTotalSize = pdev->arch == 7 ? 0 : MALI_MAX_INLINE_UNIFORM_BLOCK_SIZE * MALI_MAX_INLINE_UNIFORM_BLOCK_BINDINGS,
+      .maxInlineUniformBlockSize = inline_uniform ? MALI_MAX_INLINE_UNIFORM_BLOCK_SIZE : 0,
+      .maxPerStageDescriptorInlineUniformBlocks = inline_uniform ? MALI_MAX_INLINE_UNIFORM_BLOCK_BINDINGS : 0,
+      /* These aggregate limits include ordinary descriptor layouts too.
+       * The inline block's update-after-bind feature is queried separately. */
+      .maxPerStageDescriptorUpdateAfterBindInlineUniformBlocks = inline_uniform ? MALI_MAX_INLINE_UNIFORM_BLOCK_BINDINGS : 0,
+      .maxDescriptorSetInlineUniformBlocks = inline_uniform ? MALI_MAX_INLINE_UNIFORM_BLOCK_BINDINGS : 0,
+      .maxDescriptorSetUpdateAfterBindInlineUniformBlocks = inline_uniform ? MALI_MAX_INLINE_UNIFORM_BLOCK_BINDINGS : 0,
+      .maxInlineUniformTotalSize = inline_uniform ?
+         MALI_MAX_INLINE_UNIFORM_BLOCK_SIZE * MALI_MAX_INLINE_UNIFORM_BLOCK_BINDINGS : 0,
       /* Kraid's packed signed/unsigned4x8 paths use native IDpAdd, including
        * saturating accumulation. Mixed and wider/vector forms stay on
        * generic lowering; do not claim acceleration for those forms. */
@@ -1195,16 +1338,13 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       .maxFragmentCombinedOutputResources = 8 + (1u << 12) + (1u << 8),
 
       /* Vulkan 1.1 */
-      .subgroupSize = 16,
-      /* Fixed-size control is legal: both admitted Valhall generations run
-       * 16-lane subgroups. Mesa runtime consumes stage pNext/flags and hashes
-       * them; Kraid lowers real subgroup operations and prevents workgroup
-       * merging when subgroup lane membership can be observed. Full compute
-       * subgroups require a valid local-X multiple of this fixed size. */
-      .minSubgroupSize = pdev->arch == 9 || pdev->arch == 11 ? 16 : 0,
-      .maxSubgroupSize = pdev->arch == 9 || pdev->arch == 11 ? 16 : 0,
-      .maxComputeWorkgroupSubgroups = pdev->arch == 9 || pdev->arch == 11 ? wg / 16 : 0,
-      .requiredSubgroupSizeStages = pdev->arch == 9 || pdev->arch == 11 ? VK_SHADER_STAGE_COMPUTE_BIT : 0,
+      .subgroupSize = subgroup_size,
+      /* The runtime consumes the required-size pNext and flags. The
+       * physical compute subgroup size remains fixed on each architecture. */
+      .minSubgroupSize = subgroup_control ? subgroup_size : 0,
+      .maxSubgroupSize = subgroup_control ? subgroup_size : 0,
+      .maxComputeWorkgroupSubgroups = subgroup_control ? wg / subgroup_size : 0,
+      .requiredSubgroupSizeStages = subgroup_control ? VK_SHADER_STAGE_COMPUTE_BIT : 0,
       /*
        * Only what a 1.1 device must have until we have checked which
        * subgroup operations kraid (Mesa's Bifrost backend on v7) handles.
@@ -1213,18 +1353,7 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
        */
       .subgroupSupportedStages = VK_SHADER_STAGE_FRAGMENT_BIT |
                                  VK_SHADER_STAGE_COMPUTE_BIT,
-      .subgroupSupportedOperations =
-         VK_SUBGROUP_FEATURE_BASIC_BIT |
-         ((pdev->arch == 9 || pdev->arch == 11) ?
-             VK_SUBGROUP_FEATURE_VOTE_BIT |
-             VK_SUBGROUP_FEATURE_ARITHMETIC_BIT |
-             VK_SUBGROUP_FEATURE_BALLOT_BIT |
-             VK_SUBGROUP_FEATURE_SHUFFLE_BIT |
-             VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT |
-             VK_SUBGROUP_FEATURE_CLUSTERED_BIT |
-             VK_SUBGROUP_FEATURE_QUAD_BIT |
-             VK_SUBGROUP_FEATURE_ROTATE_BIT_KHR |
-             VK_SUBGROUP_FEATURE_ROTATE_CLUSTERED_BIT_KHR : 0),
+      .subgroupSupportedOperations = subgroup_operations_for_arch(pdev->arch),
       .subgroupQuadOperationsInAllStages = false,
       .pointClippingBehavior = VK_POINT_CLIPPING_BEHAVIOR_ALL_CLIP_PLANES,
       .maxMultiviewViewCount = 8,
@@ -1239,6 +1368,8 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       .maxTimelineSemaphoreValueDifference = UINT64_MAX,
 
       /* VK_KHR_driver_properties */
+      .shaderSignedZeroInfNanPreserveFloat32 =
+         shader_float_controls2_lab_for_arch(p->arch_major),
       .driverID = VK_DRIVER_ID_ARM_PROPRIETARY,
       .conformanceVersion = { 0, 0, 0, 0 },
 
@@ -1265,6 +1396,22 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
        * It needs its own per-sample ordering/value tests. */
       .dynamicRenderingLocalReadDepthStencilAttachments = true,
       .dynamicRenderingLocalReadMultisampledAttachments = false,
+
+      /* The supported YCbCr formats use at most three sampled planes.
+       * Block-compatible views are single-layer, and there is no FSR. */
+      .maxCombinedImageSamplerDescriptorCount = mali_ycbcr_enabled(pdev->arch) ? 3 : 1,
+      .earlyFragmentMultisampleCoverageAfterSampleCounting = true,
+      .earlyFragmentSampleMaskTestBeforeSampleCounting = true,
+      .depthStencilSwizzleOneSupport = false,
+      .polygonModePointSize = false,
+      .nonStrictSinglePixelWideLinesUseParallelogram = false,
+      .nonStrictWideLinesUseParallelogram = false,
+      .defaultRobustnessStorageBuffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED,
+      .defaultRobustnessUniformBuffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED,
+      .defaultRobustnessVertexInputs = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED,
+      .defaultRobustnessImages = VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED,
+      .blockTexelViewCompatibleMultipleLayers = false,
+      .fragmentShadingRateClampCombinerInputs = false,
    };
 
    /*
@@ -1353,8 +1500,6 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       props->maxDescriptorSetStorageBuffers = 1u << 12;
       props->maxDescriptorSetSampledImages = UINT16_MAX;
       props->maxDescriptorSetStorageImages = 1u << 8;
-      props->subgroupSize = 8;
-
       /* VK_MALISX2_descriptor_indexing (get_descriptor_indexing_features):
        * the limits start as the ordinary ones; per-stage ones are raised
        * below. A non-uniform index must be uniform within a fragment quad
@@ -1495,8 +1640,13 @@ mali_GetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice physicalDevice,
          .timestampValidBits = pdev->timestamp_hz ? 64 : 0,
          .minImageTransferGranularity = { 1, 1, 1 },
       };
-      /* No pNext structure we know is filled: we expose no global
-       * priorities and no other queue-family extension. */
+      VkQueueFamilyGlobalPriorityProperties *priority =
+         vk_find_struct(p->pNext, QUEUE_FAMILY_GLOBAL_PRIORITY_PROPERTIES);
+      if (priority) {
+         priority->priorityCount = 2;
+         priority->priorities[0] = VK_QUEUE_GLOBAL_PRIORITY_LOW;
+         priority->priorities[1] = VK_QUEUE_GLOBAL_PRIORITY_MEDIUM;
+      }
    }
 }
 
@@ -1511,7 +1661,7 @@ mali_GetPhysicalDeviceMemoryProperties2(VkPhysicalDevice physicalDevice,
       switch (stype) {
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT: {
          VkPhysicalDeviceMemoryBudgetPropertiesEXT *b = ext;
-         const uint64_t used = p_atomic_read(&pdev->heap_used);
+         const uint64_t used = p_atomic_read(pdev->process_heap_used);
 
          for (unsigned i = 0; i < VK_MAX_MEMORY_HEAPS; i++) {
             b->heapBudget[i] = 0;
@@ -1552,8 +1702,12 @@ probe_log_append(void *user, const char *msg)
       l->len = MIN2(l->len + (size_t)n, sizeof(l->text) - 1);
 }
 
+/* Physical device handles belong to an instance, while the EXT_memory_budget
+ * usage estimate belongs to the process. Use one atomic counter per node. */
+static uint64_t process_heap_used[MALI_MAX_PHYSICAL_DEVICES];
+
 static VkResult
-physical_device_create(struct mali_instance *instance, const char *path,
+physical_device_create(struct mali_instance *instance, unsigned node, const char *path,
                        struct vk_physical_device **out)
 {
    struct probe_log log = { .len = 0 };
@@ -1585,6 +1739,7 @@ physical_device_create(struct mali_instance *instance, const char *path,
       return vk_error(instance, VK_ERROR_OUT_OF_HOST_MEMORY);
    }
    snprintf(pdev->path, sizeof(pdev->path), "%s", path);
+   pdev->process_heap_used = &process_heap_used[node];
    pdev->props = kb->props;
    pdev->cs_work_registers = kb->glb.cs_work_registers;
    pdev->arch = pdev->props.arch_major;
@@ -1635,6 +1790,8 @@ physical_device_create(struct mali_instance *instance, const char *path,
 
    struct vk_device_extension_table extensions =
       device_extensions_for_arch(pdev->arch);
+   features.attachmentFeedbackLoopLayout = attachment_feedback_loop_lab(pdev->arch);
+   extensions.EXT_attachment_feedback_loop_layout = features.attachmentFeedbackLoopLayout;
 
    /* Keep the feature and format queries consistent. Applications use the
     * 4444 features to choose the component mapping for sampled views. */
@@ -1711,7 +1868,7 @@ mali_physical_devices_enumerate(struct vk_instance *vk_instance)
          continue;
 
       struct vk_physical_device *pdev;
-      VkResult result = physical_device_create(instance, path, &pdev);
+      VkResult result = physical_device_create(instance, i, path, &pdev);
       if (result == VK_ERROR_INCOMPATIBLE_DRIVER)
          continue;
       if (result != VK_SUCCESS)
