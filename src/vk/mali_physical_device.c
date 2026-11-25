@@ -665,15 +665,21 @@ attachment_feedback_loop_lab(uint32_t arch)
    return value && strcmp(value, "1") == 0;
 }
 
+static bool
+subgroup_rotate_for_arch(uint32_t arch)
+{
+   /* On v7 the Bifrost compiler lowers both rotate instructions to its
+    * existing ballot/shuffle path. Qualify it in the validation build. */
+   return arch == 9 || arch == 11 ||
+          (arch == 7 && UNIFIED_API13_LAB && UNIFIED_VALIDATION_LAB);
+}
+
 static struct vk_device_extension_table
 device_extensions_for_arch(uint32_t arch)
 {
    struct vk_device_extension_table ext = mali_device_extensions;
    const bool shader_resources = vulkan13_shader_and_resource_features_for_arch(arch);
-   /* Existing VTN + Bifrost NIR subgroup lowering produces ballot and
-    * read_invocation operations handled by Kraid on these generations.
-    * Leave v7 unchanged pending independent native qualification. */
-   ext.KHR_shader_subgroup_rotate = arch == 9 || arch == 11;
+   ext.KHR_shader_subgroup_rotate = subgroup_rotate_for_arch(arch);
    ext.KHR_shader_expect_assume = shader_expect_assume_for_arch(arch);
    ext.KHR_shader_float_controls2 = shader_float_controls2_lab_for_arch(arch);
    ext.KHR_variable_pointers = variable_pointers_lab_for_arch(arch);
@@ -985,8 +991,8 @@ get_features(struct vk_features *f, uint32_t arch)
       .shaderIntegerDotProduct = shader_resources,
       .subgroupSizeControl = subgroup_size_control_for_arch(arch),
       .computeFullSubgroups = subgroup_size_control_for_arch(arch),
-      .shaderSubgroupRotate = arch == 9 || arch == 11,
-      .shaderSubgroupRotateClustered = arch == 9 || arch == 11,
+      .shaderSubgroupRotate = subgroup_rotate_for_arch(arch),
+      .shaderSubgroupRotateClustered = subgroup_rotate_for_arch(arch),
       .shaderExpectAssume = shader_expect_assume_for_arch(arch),
       .shaderFloatControls2 = shader_float_controls2_lab_for_arch(arch),
       .samplerMirrorClampToEdge = sampler_and_buffer_layout_for_arch(arch),
