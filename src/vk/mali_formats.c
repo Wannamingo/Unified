@@ -454,8 +454,13 @@ mali_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
       }
       case VK_STRUCTURE_TYPE_HOST_IMAGE_COPY_DEVICE_PERFORMANCE_QUERY: {
          VkHostImageCopyDevicePerformanceQuery *q = ext;
-         q->optimalDeviceAccess = pInfo->tiling == VK_IMAGE_TILING_LINEAR;
-         q->identicalMemoryLayout = pInfo->tiling == VK_IMAGE_TILING_LINEAR;
+         /* Host transfer disables AFBC. Block-compressed textures and
+          * planar YCbCr never use AFBC, and linear tiling is unchanged. */
+         const bool identical = pInfo->tiling == VK_IMAGE_TILING_LINEAR ||
+                                vk_format_is_compressed(pInfo->format) ||
+                                mali_format_is_ycbcr(pInfo->format);
+         q->optimalDeviceAccess = identical;
+         q->identicalMemoryLayout = identical;
          break;
       }
       default:
