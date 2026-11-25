@@ -320,7 +320,8 @@ image_init_layout(struct mali_device *dev, struct mali_image *image,
    const bool fd = external && (external->handleTypes & MALI_EXTERNAL_FD_TYPES);
    const bool drm = pCreateInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
    const bool yuv = mali_format_is_ycbcr(image->vk.format);
-   const bool external_yuv = yuv && image->android_external_format && image->ahb;
+   const bool external_yuv = yuv && image->android_external_format && image->ahb &&
+                             mali_ycbcr_external_enabled(pdev->arch);
    if (yuv &&
        (!mali_ycbcr_enabled(pdev->arch) || fd || drm || (image->ahb && !external_yuv) || wsi_scanout ||
         pCreateInfo->imageType != VK_IMAGE_TYPE_2D || pCreateInfo->mipLevels != 1 ||

@@ -45,7 +45,14 @@ mali_format_is_ycbcr(VkFormat format)
 
 bool mali_ycbcr_enabled(uint32_t arch);
 
-#define MALI_HOST_COPY_LAYOUT_COUNT 5
+/* External Android YUV has separate Gralloc and cache-coherency requirements. */
+static inline bool
+mali_ycbcr_external_enabled(uint32_t arch)
+{
+   return arch == 11 && mali_ycbcr_enabled(arch);
+}
+
+#define MALI_HOST_COPY_LAYOUT_COUNT 7
 extern VkImageLayout mali_host_copy_layouts[MALI_HOST_COPY_LAYOUT_COUNT];
 bool mali_host_copy_enabled(uint32_t arch);
 

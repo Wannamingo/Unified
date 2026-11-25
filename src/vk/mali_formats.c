@@ -38,7 +38,9 @@
 bool
 mali_ycbcr_enabled(uint32_t arch)
 {
-   return arch == 11 && debug_get_bool_option("UNIFIED_YUV", false);
+   const bool supported = arch == 11 ||
+      (UNIFIED_API13_LAB && UNIFIED_VALIDATION_LAB && (arch == 7 || arch == 9));
+   return supported && debug_get_bool_option("UNIFIED_YUV", false);
 }
 
 unsigned

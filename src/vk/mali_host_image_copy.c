@@ -14,6 +14,8 @@ VkImageLayout mali_host_copy_layouts[MALI_HOST_COPY_LAYOUT_COUNT] = {
    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+   VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL,
+   VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL,
 };
 
 bool
@@ -317,10 +319,12 @@ mali_CopyImageToImage(VkDevice device, const VkCopyImageToImageInfo *info)
                    p->src.host_surface_stride);
             continue;
          }
+         const unsigned step = p->src.plane.tile_side || p->dst.plane.tile_side ?
+                               1 : p->src.blocks.width;
+         const size_t bytes = (size_t)step * p->src.plane.block_bytes;
          for (unsigned y = 0; y < p->src.blocks.height; ++y)
-            for (unsigned x = 0; x < p->src.blocks.width; ++x)
-               memcpy(block_at(&p->dst, x, y, z), block_at(&p->src, x, y, z),
-                      p->src.plane.block_bytes);
+            for (unsigned x = 0; x < p->src.blocks.width; x += step)
+               memcpy(block_at(&p->dst, x, y, z), block_at(&p->src, x, y, z), bytes);
       }
    }
    dst->fresh = false;

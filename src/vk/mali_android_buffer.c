@@ -366,7 +366,7 @@ mali_android_external_image_info(struct mali_device *dev,
       vk_find_struct_const(in->pNext, EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
    VkFormat format = mali_android_rgb_token_format(ext->externalFormat, NULL);
    if (format == VK_FORMAT_UNDEFINED && android.string_compare &&
-       mali_ycbcr_enabled(mali_device_physical(dev)->arch))
+       mali_ycbcr_external_enabled(mali_device_physical(dev)->arch))
       format = mali_android_yuv_token_format(ext->externalFormat, NULL);
    if (!mali_android_buffer_available() || !mem ||
        mem->handleTypes != VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID ||
@@ -401,7 +401,7 @@ mali_CreateSamplerYcbcrConversion(VkDevice device,
    VkFormat format = mali_android_rgb_token_format(external->externalFormat, &swap);
    bool yuv = false;
    if (format == VK_FORMAT_UNDEFINED && android.string_compare &&
-       mali_ycbcr_enabled(mali_device_physical(dev)->arch)) {
+       mali_ycbcr_external_enabled(mali_device_physical(dev)->arch)) {
       format = mali_android_yuv_token_format(external->externalFormat, &swap);
       yuv = mali_format_is_ycbcr(format);
    }
@@ -572,7 +572,7 @@ mali_GetAndroidHardwareBufferPropertiesANDROID(VkDevice device, const AHardwareB
    VkResult r = mali_android_ahb_info(buffer, &info);
    if (r != VK_SUCCESS) return r;
    const bool yuv = info.yuv.plane_count != 0;
-   if (yuv && !mali_ycbcr_enabled(mali_device_physical(dev)->arch))
+   if (yuv && !mali_ycbcr_external_enabled(mali_device_physical(dev)->arch))
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    props->allocationSize=info.allocation_size;
    props->memoryTypeBits=1u << MALI_MEMORY_TYPE_EXTERNAL_CACHED;

@@ -1317,7 +1317,6 @@ layout_check_instr(nir_builder *b, nir_instr *instr, void *data)
    return false;
 }
 
-#if PAN_ARCH >= 10
 static const struct vk_ycbcr_conversion_state *
 ycbcr_conversion(const void *data, uint32_t set, uint32_t binding, uint32_t index)
 {
@@ -1334,7 +1333,6 @@ ycbcr_conversion(const void *data, uint32_t set, uint32_t binding, uint32_t inde
       return NULL;
    return &bl->immutable_ycbcr[index];
 }
-#endif
 
 #if PAN_ARCH == 11
 /* Application-side opt-in for the captured local-read shader. The renderer
@@ -1452,10 +1450,8 @@ lower_nir(struct mali_device *dev, nir_shader *nir, const struct mali_shader_com
    };
    NIR_PASS(_, nir, nir_opt_access, &access_options);
 
-#if PAN_ARCH >= 10
    if (dev->vk.enabled_features.samplerYcbcrConversion)
       NIR_PASS(_, nir, nir_vk_lower_ycbcr_tex, ycbcr_conversion, info->layout);
-#endif
 
    if (rs->images == VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_ROBUST_IMAGE_ACCESS_EXT ||
        rs->storage_buffers == VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_EXT ||

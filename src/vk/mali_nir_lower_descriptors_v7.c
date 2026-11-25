@@ -35,8 +35,8 @@
  *    through the common.constant_data sysval (Bifrost has no PC-relative
  *    constant pool).
  *
- * Left out of panvk's: YCbCr conversion and multi-plane descriptors, null
- * descriptors.
+ * Each converted image copies all its planes into consecutive texture
+ * entries. Null descriptors are not supported.
  */
 
 #include "mali_shader.h"
@@ -496,12 +496,10 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, struct lower_desc_ctx *ctx)
          nir_tex_instr_remove_src(tex, offset_src);
    }
 
+   nir_def *plane_src = nir_steal_tex_src(tex, nir_tex_src_plane);
+   const unsigned plane = plane_src ? nir_src_as_uint(nir_src_for_ssa(plane_src)) : 0;
    int sampler_src_idx = nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
    if (sampler_src_idx >= 0) {
-      nir_def *plane = nir_steal_tex_src(tex, nir_tex_src_plane);
-      assert(!plane || nir_src_as_uint(nir_src_for_ssa(plane)) == 0);
-      (void)plane;
-
       nir_deref_instr *deref = nir_src_as_deref(tex->src[sampler_src_idx].src);
       nir_tex_instr_remove_src(tex, sampler_src_idx);
 
@@ -550,9 +548,10 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, struct lower_desc_ctx *ctx)
       nir_def *index_ssa;
       get_resource_deref_binding(deref, &set, &binding, &index_imm, &index_ssa, &max_idx);
 
+      const struct mali_descriptor_set_binding_layout *bl = binding_layout(ctx, set, binding);
+      assert(plane < bl->textures_per_desc);
       if ((int)set == ctx->direct_set) {
-         const struct mali_descriptor_set_binding_layout *bl = binding_layout(ctx, set, binding);
-         const uint32_t slot = mali_desc_index(bl, index_imm, MALI_SUBDESC_TEXTURE);
+         const uint32_t slot = mali_desc_index(bl, index_imm, MALI_SUBDESC_TEXTURE) + plane;
          if (index_ssa) {
             nir_tex_instr_add_src(tex, nir_tex_src_texture_offset,
                                   nir_iadd_imm(b, nir_imul_imm(b, index_ssa, mali_desc_stride(bl)),
@@ -563,11 +562,12 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, struct lower_desc_ctx *ctx)
          return true;
       }
 
-      const uint32_t texture_index =
-         shader_desc_idx(ctx, set, binding, MALI_SUBDESC_TEXTURE) + index_imm;
+      const uint32_t texture_index = shader_desc_idx(ctx, set, binding, MALI_SUBDESC_TEXTURE) +
+                                     index_imm * bl->textures_per_desc + plane;
       if (index_ssa) {
          nir_tex_instr_add_src(tex, nir_tex_src_texture_offset,
-                               nir_iadd_imm(b, index_ssa, texture_index));
+                               nir_iadd_imm(b, nir_imul_imm(b, index_ssa, bl->textures_per_desc),
+                                            texture_index));
       } else {
          tex->texture_index = texture_index;
       }
@@ -673,6 +673,13 @@ lower_descriptors_instr(nir_builder *b, nir_instr *instr, void *data)
 /* ---------------------------------------------------------------------- */
 /* First pass: which bindings the shader reaches, and how many elements   */
 
+static uint32_t
+copy_slots(const struct mali_descriptor_set_binding_layout *bl, bool sampler_subdesc)
+{
+   return bl->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && !sampler_subdesc ?
+          bl->textures_per_desc : 1;
+}
+
 static void
 record_binding(struct lower_desc_ctx *ctx, uint32_t set, uint32_t binding, enum mali_subdesc sub,
                uint32_t max_idx)
@@ -704,7 +711,8 @@ record_binding(struct lower_desc_ctx *ctx, uint32_t set, uint32_t binding, enum 
       return;
 
    _mesa_hash_table_u64_insert(ctx->ht, id.ht_key, (void *)(uintptr_t)new_count);
-   map_of(ctx, bl, sampler_subdesc)->count += new_count - old_count;
+   map_of(ctx, bl, sampler_subdesc)->count +=
+      (new_count - old_count) * copy_slots(bl, sampler_subdesc);
 }
 
 static bool
@@ -813,7 +821,7 @@ choose_direct_set(struct lower_desc_ctx *ctx)
    ctx->direct_sampler_slot = first;
 }
 
-/* The copy map entries of one binding: count elements, one entry each. */
+/* One map entry per copied hardware slot. */
 static uint32_t *
 fill_copy_descs(struct lower_desc_ctx *ctx, uint32_t set, uint32_t binding, bool sampler_subdesc,
                 uint32_t count)
@@ -831,7 +839,8 @@ fill_copy_descs(struct lower_desc_ctx *ctx, uint32_t set, uint32_t binding, bool
                               bl->desc_idx + i :
                               mali_desc_index(bl, i, sampler_subdesc ? MALI_SUBDESC_SAMPLER :
                                                                         MALI_SUBDESC_TEXTURE);
-      map->map[map->count++] = MALI_COPY_DESC_HANDLE(set, src);
+      for (uint32_t slot = 0; slot < copy_slots(bl, sampler_subdesc); ++slot)
+         map->map[map->count++] = MALI_COPY_DESC_HANDLE(set, src + slot);
    }
    return first;
 }
