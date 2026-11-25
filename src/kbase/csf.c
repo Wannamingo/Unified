@@ -38,8 +38,7 @@ mali_kbase_group_create(struct mali_kbase *kb,
                         uint8_t *handle)
 {
    /* Tiler endpoint 0 only, every fragment and compute endpoint, at most
-    * 1 tiler and 64 fragment/compute endpoints. UK >= 1.19 form of the
-    * ioctl; we only speak 1.20. */
+    * 1 tiler and 64 fragment/compute endpoints. */
    union kb_ioctl_cs_queue_group_create gc;
    memset(&gc, 0, sizeof(gc));
    gc.in.tiler_mask = 1;
@@ -53,13 +52,25 @@ mali_kbase_group_create(struct mali_kbase *kb,
    /* BASE_CSF_TILER_OOM_EXCEPTION_FLAG (UK >= 1.12). */
    gc.in.csi_handlers = info->tiler_oom_handler ? 1 : 0;
 
-   long ret = kb_ioctl(kb, KB_IOCTL_CS_QUEUE_GROUP_CREATE, &gc);
+   long ret;
+   uint8_t group_handle;
+   if (kb->uk_minor < KB_UK_GROUP_CREATE_112_MINOR) {
+      /* UK 1.18 uses the same 40-byte prefix, including the exception
+       * handler flags used by Unified's tiler OOM recovery. */
+      union kb_ioctl_cs_queue_group_create_1_18 legacy;
+      memcpy(&legacy, &gc.in, sizeof(legacy));
+      ret = kb_ioctl(kb, KB_IOCTL_CS_QUEUE_GROUP_CREATE_1_18, &legacy);
+      group_handle = legacy.out.group_handle;
+   } else {
+      ret = kb_ioctl(kb, KB_IOCTL_CS_QUEUE_GROUP_CREATE, &gc);
+      group_handle = gc.out.group_handle;
+   }
    if (ret < 0) {
-      KB_LOG(kb, "CS_QUEUE_GROUP_CREATE (%u CSs, priority %u) failed: %s",
-             info->cs_count, info->priority, strerror((int)-ret));
+      KB_LOG(kb, "CS_QUEUE_GROUP_CREATE (UK 1.%u, %u CSs, priority %u) failed: %s",
+             kb->uk_minor, info->cs_count, info->priority, strerror((int)-ret));
       return kb_result_from_errno((int)-ret, KB_ERRNO_GENERIC);
    }
-   *handle = gc.out.group_handle;
+   *handle = group_handle;
    return MALI_KBASE_SUCCESS;
 }
 

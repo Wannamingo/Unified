@@ -549,8 +549,12 @@ push_begin(struct mali_cmd_buffer *cmd, struct mali_desc_state *st, unsigned sha
 
    struct mali_descriptor_set *set = &st->push[idx];
    struct mali_push_shadow *sh = &cmd->push_shadow.s[shadow_bp][idx];
-   const bool carry = st->sets[idx] == set && set->layout == layout;
    const uint32_t size = layout->desc_count * MALI_DESCRIPTOR_SIZE;
+   /* With maintenance4, a destroyed layout's address may be reused while
+    * this command buffer is recording. A larger replacement must start
+    * from initialized slots even if its address matches. */
+   const bool carry = st->sets[idx] == set && set->layout == layout &&
+                      set->desc_count == layout->desc_count && size <= sh->size;
 
    out->set = set;
    out->dst = NULL;
@@ -567,8 +571,6 @@ push_begin(struct mali_cmd_buffer *cmd, struct mali_desc_state *st, unsigned sha
          return false;
       }
       if (size > sh->size) {
-         /* Only a new layout grows it, and a new layout carries nothing. */
-         assert(!carry);
          void *data = vk_alloc(&cmd->vk.pool->alloc, size, 16,
                                VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
          if (!data) {

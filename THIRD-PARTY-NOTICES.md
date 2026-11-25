@@ -20,3 +20,10 @@ The Rust dependencies are pinned by `subprojects/*.wrap`, with versions and orig
 ## zenithblue PanVK
 
 The experimental LOAD dependency optimisation was adapted from the zenithblue PanVK patch 0119, authored by abhay-byte. [Upstream patch](https://github.com/zenithblue-oss/panvk-kbase-android/commit/078cbd6f0f50b13d5d51038904afb4887b780f42)
+
+## Upstream driver fixes in Unified 0.4.92
+
+The forward-pixel-kill guard, packed RGB image capability restriction,
+push-descriptor shadow initialization and CSF UK 1.18/1.19 compatibility
+were adapted from the MIT-licensed [0.6.1 source](https://github.com/bmdhacks/malisx2/tree/v0.6.1)
+by Brian Degenhardt: `9c51152`, `0e67eaa`, `17b4676` and `a049087`.

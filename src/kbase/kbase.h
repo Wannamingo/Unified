@@ -264,7 +264,7 @@ struct mali_kbase {
    const struct mali_kbase_backend *backend;
    int fd;
    enum mali_kbase_frontend frontend;
-   uint16_t uk_major, uk_minor;  /* negotiated: 1.20 on CSF, 11.22 to 11.36 on JM */
+   uint16_t uk_major, uk_minor;  /* negotiated: 1.18 to 1.20 on CSF, 11.22 to 11.36 on JM */
    struct mali_kbase_gpu_props props;
    struct mali_kbase_glb_iface glb;          /* CSF only; zero on JM */
    /* The GPU's user register page, mapped read-only. CSF only; NULL on JM. */

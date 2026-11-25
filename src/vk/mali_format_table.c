@@ -24,6 +24,7 @@
 #include "pan_format.h"
 
 #include "util/format/u_format.h"
+#include "util/u_math.h"
 #include "vk_format.h"
 
 static const struct pan_format *
@@ -118,6 +119,13 @@ MALI_PER_ARCH(format_image_features)(const struct mali_physical_device *pdev, Vk
 
    const enum pipe_format p = vk_format_to_pipe_format(format);
    if (!pipe_format_supported(pdev, p))
+      return 0;
+
+   /* Buffer-image copies have integer texel representations for 1, 2,
+    * 4, 8 and 16 bytes. Keep unsupported packed RGB images out of the
+    * queries without removing their separate vertex capabilities. */
+   if (!util_format_is_compressed(p) &&
+       !util_is_power_of_two_nonzero(util_format_get_blocksize(p)))
       return 0;
 
    const struct pan_format *f = pan_fmt(p);

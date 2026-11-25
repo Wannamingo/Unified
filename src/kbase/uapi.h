@@ -32,6 +32,8 @@
  * VERSION_CHECK with min(its minor, our minor) for major 1. */
 #define KB_UK_VERSION_MAJOR 1
 #define KB_UK_VERSION_MINOR 20
+#define KB_UK_MIN_MINOR 18
+#define KB_UK_GROUP_CREATE_112_MINOR 19
 
 #define KB_IOCTL_TYPE 0x80
 
@@ -216,6 +218,28 @@ struct kb_ioctl_cs_queue_terminate {
    uint64_t buffer_gpu_addr;
 };
 
+/* UK 1.18 uses a shorter argument on the same ioctl number. */
+union kb_ioctl_cs_queue_group_create_1_18 {
+   struct {
+      uint64_t tiler_mask;
+      uint64_t fragment_mask;
+      uint64_t compute_mask;
+      uint8_t cs_min;
+      uint8_t priority;
+      uint8_t tiler_max;
+      uint8_t fragment_max;
+      uint8_t compute_max;
+      uint8_t csi_handlers;
+      uint16_t reserved;
+      uint64_t dvs_buf;
+   } in;
+   struct {
+      uint8_t group_handle;
+      uint8_t padding[3];
+      uint32_t group_uid;
+   } out;
+};
+
 /* UK >= 1.19 form (nr 58). */
 union kb_ioctl_cs_queue_group_create {
    struct {
@@ -379,6 +403,8 @@ union kb_ioctl_get_cpu_gpu_timeinfo {
 #define KB_IOCTL_CS_CPU_QUEUE_DUMP  _IOW(KB_IOCTL_TYPE, 53, struct kb_ioctl_cs_cpu_queue_info)
 #define KB_IOCTL_CS_QUEUE_GROUP_CREATE \
    _IOWR(KB_IOCTL_TYPE, 58, union kb_ioctl_cs_queue_group_create)
+#define KB_IOCTL_CS_QUEUE_GROUP_CREATE_1_18 \
+   _IOWR(KB_IOCTL_TYPE, 58, union kb_ioctl_cs_queue_group_create_1_18)
 #define KB_IOCTL_MEM_EXEC_INIT    _IOW(KB_IOCTL_TYPE, 38, struct kb_ioctl_mem_exec_init)
 #define KB_IOCTL_CS_GET_GLB_IFACE _IOWR(KB_IOCTL_TYPE, 51, union kb_ioctl_cs_get_glb_iface)
 #define KB_IOCTL_VERSION_CHECK    _IOWR(KB_IOCTL_TYPE, 52, struct kb_ioctl_version_check)
@@ -586,6 +612,11 @@ KB_CHECK_SIZE(union kb_ioctl_cs_queue_bind, 16);
 KB_CHECK_OFF(union kb_ioctl_cs_queue_bind, in.group_handle, 8);
 KB_CHECK_OFF(union kb_ioctl_cs_queue_bind, in.csi_index, 9);
 KB_CHECK_SIZE(struct kb_ioctl_cs_queue_terminate, 8);
+KB_CHECK_SIZE(union kb_ioctl_cs_queue_group_create_1_18, 40);
+KB_CHECK_OFF(union kb_ioctl_cs_queue_group_create_1_18, in.cs_min, 24);
+KB_CHECK_OFF(union kb_ioctl_cs_queue_group_create_1_18, in.csi_handlers, 29);
+KB_CHECK_OFF(union kb_ioctl_cs_queue_group_create_1_18, in.dvs_buf, 32);
+KB_CHECK_OFF(union kb_ioctl_cs_queue_group_create_1_18, out.group_uid, 4);
 KB_CHECK_SIZE(union kb_ioctl_cs_queue_group_create, 112);
 KB_CHECK_OFF(union kb_ioctl_cs_queue_group_create, in.cs_min, 24);
 KB_CHECK_OFF(union kb_ioctl_cs_queue_group_create, in.csi_handlers, 29);
@@ -626,6 +657,7 @@ _Static_assert(KB_IOCTL_MEM_ALLOC_EX == 0xc040803b, "MEM_ALLOC_EX");
 KB_CHECK_SIZE(union kb_ioctl_get_cpu_gpu_timeinfo, 32);
 _Static_assert(KB_IOCTL_GET_CPU_GPU_TIMEINFO == 0xc0208032, "GET_CPU_GPU_TIMEINFO");
 _Static_assert(KB_IOCTL_CS_QUEUE_GROUP_CREATE == 0xc070803a, "GROUP_CREATE");
+_Static_assert(KB_IOCTL_CS_QUEUE_GROUP_CREATE_1_18 == 0xc028803a, "GROUP_CREATE_1_18");
 _Static_assert(KB_IOCTL_CS_QUEUE_GROUP_TERMINATE == 0x4008802b, "GROUP_TERMINATE");
 _Static_assert(KB_IOCTL_CS_TILER_HEAP_INIT == 0xc0188030, "TILER_HEAP_INIT");
 _Static_assert(KB_IOCTL_CS_EVENT_SIGNAL == 0x802c, "CS_EVENT_SIGNAL");

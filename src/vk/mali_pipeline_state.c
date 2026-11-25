@@ -762,6 +762,21 @@ draw_mode(enum mesa_prim prim)
    }
 }
 
+/* A fragment may kill older fragments only if it overwrites every colour
+ * attachment. Shader exports alone do not imply writes: a target may have
+ * its write mask or colour writes disabled, or use logic-op NOOP.
+ * Adapted from bmdhacks commit 9c511528cf76. */
+static uint8_t
+blend_written_mask(const struct mali_gfx_baked *out)
+{
+   uint8_t mask = 0;
+   for (unsigned i = 0; i < MIN2(out->rt_count, MALI_MAX_RTS); i++) {
+      if (out->blend[i].mode != MALI_BLEND_RT_OFF)
+         mask |= BITFIELD_BIT(i);
+   }
+   return mask;
+}
+
 static void
 pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
 {
@@ -787,12 +802,8 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
       out->rt_written = color_attachment_written_mask(fs, &dyn->cal);
       /* CSF's DCD masks must match the blend descriptors. In particular,
        * a depth/occlusion draw may export color with all color writes off. */
-      if (PAN_ARCH == 11) {
-         for (unsigned i = 0; i < MIN2(out->rt_count, MALI_MAX_RTS); i++) {
-            if (out->blend[i].mode == MALI_BLEND_RT_OFF)
-               out->rt_written &= ~BITFIELD_BIT(i);
-         }
-      }
+      if (PAN_ARCH == 11)
+         out->rt_written &= blend_written_mask(out);
       out->rt_read = color_attachment_read_mask(fs, &dyn->ial, rt_mask);
       modifies_coverage = fs->info.fs.writes_coverage || fs->info.fs.can_discard || a2c;
    }
@@ -846,7 +857,8 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
                (dyn->rasterization_order_access & VK_IMAGE_ASPECT_COLOR_BIT) && out->rt_read;
 
             cfg.allow_forward_pixel_to_kill =
-               fs->info.fs.can_fpk && !(rt_mask & ~out->rt_written) &&
+               fs->info.fs.can_fpk &&
+               !(rt_mask & ~(out->rt_written & blend_written_mask(out))) &&
                !(out->rt_read & out->rt_written) && !a2c && !out->any_dest_read &&
                !roa_color && !feedback_loop;
             cfg.allow_forward_pixel_to_be_killed = !fs->info.writes_global && !feedback_loop;
@@ -873,8 +885,8 @@ pack_flags(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
                dyn->ms.rasterization_samples > 1;
             cfg.shader_modifies_coverage = modifies_coverage;
          } else {
-            cfg.allow_forward_pixel_to_kill = true;
-            cfg.allow_forward_pixel_to_be_killed = true;
+            cfg.allow_forward_pixel_to_kill = !rt_mask && !feedback_loop;
+            cfg.allow_forward_pixel_to_be_killed = !feedback_loop;
             cfg.pixel_kill_operation = MALI_PIXEL_KILL_FORCE_EARLY;
             cfg.zs_update_operation = MALI_PIXEL_KILL_FORCE_EARLY;
             cfg.overdraw_alpha0 = true;
@@ -1083,7 +1095,8 @@ pack_rsd(const struct mali_gfx_pack_input *in, const struct mali_gfx_baked *out,
          const bool roa_color = dyn->rasterization_order_access & VK_IMAGE_ASPECT_COLOR_BIT;
 
          cfg.properties.allow_forward_pixel_to_kill =
-            fs->info.fs.can_fpk && !(rt_mask & ~out->rt_written) &&
+            fs->info.fs.can_fpk &&
+            !(rt_mask & ~(out->rt_written & blend_written_mask(out))) &&
             !(out->rt_read & out->rt_written) && !a2c && !out->any_dest_read && !roa_color;
          /* The hardware does the early ZS check for FPK on v7 (panvk). */
          cfg.properties.allow_forward_pixel_to_be_killed = !fs->info.writes_global;
@@ -1106,7 +1119,7 @@ pack_rsd(const struct mali_gfx_pack_input *in, const struct mali_gfx_baked *out,
             fs->info.fs.sample_shading && dyn->ms.rasterization_samples > 1;
       } else {
          cfg.properties.depth_source = MALI_DEPTH_SOURCE_FIXED_FUNCTION;
-         cfg.properties.allow_forward_pixel_to_kill = true;
+         cfg.properties.allow_forward_pixel_to_kill = !rt_mask;
          cfg.properties.allow_forward_pixel_to_be_killed = true;
          cfg.properties.zs_update_operation = MALI_PIXEL_KILL_FORCE_EARLY;
       }
