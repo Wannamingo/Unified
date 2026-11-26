@@ -886,8 +886,8 @@ get_features(struct vk_features *f, uint32_t arch)
        * for the G52, G57 or G68 (it does for the G51 and G72). */
       .samplerAnisotropy = true,
       .customBorderColors = true,
-      /* Bifrost needs the view format to pack the AFBC channel order. */
-      .customBorderColorWithoutFormat = arch != 7,
+      /* v7_afbc_format admits only channel orders that preserve border RGBA. */
+      .customBorderColorWithoutFormat = true,
       .textureCompressionETC2 = true,
       .textureCompressionASTC_LDR = true,
       .textureCompressionBC = false,  /* bc_formats_complete */

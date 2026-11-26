@@ -134,8 +134,9 @@ can_use_afbc(const struct mali_image *image, const enum pipe_format *formats,
  * as a flag on RGBA8), whose component order the v7 texture unit accepts
  * with AFBC as it is. pan_afbc_format at PAN_ARCH 7 accepts more (RGB565,
  * RGB5A1, RGBA4, RGB10A2, the BGR orders); those are left uncompressed
- * here. The BGR orders also need pan_texture_afbc_reswizzle, with the
- * sampler border colours swizzled to match (panvk_vX_sampler.c).
+ * here. Keep this restriction in sync with customBorderColorWithoutFormat:
+ * admitting non-canonical orders requires handling their AFBC texture and
+ * border permutations without relying on the application's sampler format.
  */
 static bool
 v7_afbc_format(enum pipe_format f)
