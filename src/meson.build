@@ -137,6 +137,9 @@ mali_shader_cache_id_h = custom_target(
 if get_option('unified_api13_lab') and not (get_option('unified_api12_lab') and get_option('unified_validation_lab'))
   error('The Vulkan 1.3 lab requires unified_api12_lab and unified_validation_lab')
 endif
+if get_option('unified_api14_lab') and not get_option('unified_api13_lab')
+  error('The Vulkan 1.4 lab requires unified_api13_lab')
+endif
 
 _vk_c_args = [
   pre_args, malisx2_c_args,
@@ -144,6 +147,7 @@ _vk_c_args = [
   '-DMALI_VERSION_STRING="@0@"'.format(meson.project_version()),
   '-DUNIFIED_API12_LAB=@0@'.format(get_option('unified_api12_lab') ? '1' : '0'),
   '-DUNIFIED_API13_LAB=@0@'.format(get_option('unified_api13_lab') ? '1' : '0'),
+  '-DUNIFIED_API14_LAB=@0@'.format(get_option('unified_api14_lab') ? '1' : '0'),
   '-DUNIFIED_GEOMETRY_LAB=@0@'.format(get_option('unified_geometry_lab') ? '1' : '0'),
   '-DUNIFIED_TESSELLATION_LAB=@0@'.format(get_option('unified_tessellation_lab') ? '1' : '0'),
   '-DUNIFIED_VALIDATION_LAB=@0@'.format(get_option('unified_validation_lab') ? '1' : '0'),

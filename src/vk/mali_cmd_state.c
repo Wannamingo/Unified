@@ -138,22 +138,27 @@ MALI_PER_ARCH(CmdBindVertexBuffers2)(VkCommandBuffer commandBuffer, uint32_t fir
    struct mali_gfx_draw_state *d = &cmd->gfx.draw;
 
    assert(firstBinding + bindingCount <= MALI_MAX_VBS);
+#if PAN_ARCH >= 9
+   bool buffers_changed = false;
+#endif
    for (uint32_t i = 0; i < bindingCount; i++) {
       VK_FROM_HANDLE(vk_buffer, buf, pBuffers[i]);
       const uint32_t b = firstBinding + i;
-      if (!buf) {
-         d->vb[b].addr = 0;
-         d->vb[b].size = 0;
-         continue;
-      }
-      d->vb[b].addr = vk_buffer_address(buf, pOffsets[i]);
-      d->vb[b].size = vk_buffer_range(buf, pOffsets[i], pSizes ? pSizes[i] : VK_WHOLE_SIZE);
+      const uint64_t addr = buf ? vk_buffer_address(buf, pOffsets[i]) : 0;
+      const uint64_t size =
+         buf ? vk_buffer_range(buf, pOffsets[i], pSizes ? pSizes[i] : VK_WHOLE_SIZE) : 0;
+#if PAN_ARCH >= 9
+      buffers_changed |= d->vb[b].addr != addr || d->vb[b].size != size;
+#endif
+      d->vb[b].addr = addr;
+      d->vb[b].size = size;
    }
    if (pStrides)
       vk_cmd_set_vertex_binding_strides(&cmd->vk, firstBinding, bindingCount, pStrides);
 #if PAN_ARCH >= 9
-   /* v9+: the attributes live in the VS table (v7 packs them per draw). */
-   d->dirty |= MALI_GFX_DIRTY_VS_SRT;
+   /* The draw also invalidates the table for a dirty dynamic stride. */
+   if (buffers_changed)
+      d->dirty |= MALI_GFX_DIRTY_VS_SRT;
 #endif
 }
 
@@ -165,34 +170,29 @@ MALI_PER_ARCH(CmdBindIndexBuffer2KHR)(VkCommandBuffer commandBuffer, VkBuffer bu
    VK_FROM_HANDLE(vk_buffer, buf, buffer);
    struct mali_gfx_draw_state *d = &cmd->gfx.draw;
 
-   d->ib.index_size = vk_index_type_to_bytes(indexType);
-   if (buf) {
-      d->ib.addr = vk_buffer_address(buf, offset);
-      d->ib.size = (uint32_t)MIN2(vk_buffer_range(buf, offset, size), UINT32_MAX);
-   } else {
-      d->ib.addr = 0;
-      d->ib.size = 0;
-   }
+   const uint32_t index_size = vk_index_type_to_bytes(indexType);
+   const uint64_t addr = buf ? vk_buffer_address(buf, offset) : 0;
+   const uint32_t range = buf ? (uint32_t)MIN2(vk_buffer_range(buf, offset, size), UINT32_MAX) : 0;
+#if PAN_ARCH >= 9
+   if (d->ib.index_size == index_size && d->ib.addr == addr && d->ib.size == range)
+      return;
+#endif
+   d->ib.index_size = index_size;
+   d->ib.addr = addr;
+   d->ib.size = range;
 #if PAN_ARCH < 9
-   /* v7 runs the vertex shader over the index range of an indexed draw,
-    * which the v7 draw finds by reading the indices on the CPU
-    * (mali_jm_cmd_draw_v7.c): the buffer's CPU view, NULL when there is
-    * none, and then the draw is skipped and logged.
-    *
-    * A non-NULL CPU view is not enough to read it: the job manager places
-    * every allocation in SAME_VA and maps it with the memory type's
-    * protection, so a GPU-only type has a PROT_NONE view and a lazily
-    * allocated one may not be mapped at all; reading either faults. Only a
-    * host-visible, non-lazy, unprotected type is read. It may still be
-    * host-cached and not host-coherent, and the driver does no
-    * invalidation for a write the CPU did not make, so indices the GPU
-    * wrote can come back stale; mali_jm_cmd_draw_v7.c says what that costs. */
+   /* v7 can calculate the range on the CPU for indices it can read safely.
+    * Use the GPU when a writable, non-coherent buffer might contain stale
+    * CPU cache lines after a GPU write in a different command buffer. */
    const struct mali_buffer *mb = buf ? container_of(buf, struct mali_buffer, vk) : NULL;
    const VkMemoryPropertyFlags mem_props = (mb && mb->mem) ? mb->mem->props : 0;
+   const VkBufferUsageFlags2 gpu_writes = VK_BUFFER_USAGE_2_TRANSFER_DST_BIT |
+      VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_STORAGE_TEXEL_BUFFER_BIT;
    const bool ib_cpu_readable =
       (mem_props & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
       !(mem_props & (VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT |
-                     VK_MEMORY_PROPERTY_PROTECTED_BIT));
+                     VK_MEMORY_PROPERTY_PROTECTED_BIT)) &&
+      ((mem_props & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) || !(buf->usage & gpu_writes));
    cmd->jm.draw.ib_cpu = (ib_cpu_readable && mb->mem->bo.cpu)
                             ? (const uint8_t *)mb->mem->bo.cpu + mb->mem_offset + offset
                             : NULL;

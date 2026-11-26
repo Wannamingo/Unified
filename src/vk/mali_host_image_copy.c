@@ -23,7 +23,7 @@ mali_host_copy_enabled(uint32_t arch)
 {
    const bool supported = arch == 11 ||
       (UNIFIED_API13_LAB && UNIFIED_VALIDATION_LAB && (arch == 7 || arch == 9));
-   return supported && debug_get_bool_option("UNIFIED_HOST_IMAGE_COPY", false);
+   return supported && debug_get_bool_option("UNIFIED_HOST_IMAGE_COPY", mali_api14_lab_arch(arch));
 }
 
 static bool

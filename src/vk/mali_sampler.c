@@ -8,8 +8,7 @@
  * at creation as panvk does (panvk_vX_sampler.c, MIT), built per arch. The
  * blob packs the same fields; the two value differences are settled in
  * panvk's favour (round-to-nearest-even, and the compare function of a
- * non-comparison sampler). No YCbCr conversion, no custom border colours
- * (neither is advertised). v9's Sampler has no reduction mode (min/max
+ * non-comparison sampler). v9's Sampler has no reduction mode (min/max
  * filtering is not advertised there).
  */
 
@@ -24,6 +23,10 @@
 
 #include "genxml/gen_macros.h"
 
+#if PAN_ARCH == 7
+#include "pan_afbc.h"
+#include "vk_format.h"
+#endif
 #include "vk_log.h"
 #include "vk_sampler.h"
 #include "vk_ycbcr_conversion.h"
@@ -91,13 +94,41 @@ reduction_mode(VkSamplerReductionMode mode)
 }
 #endif
 
+#if PAN_ARCH == 7
+/* Bifrost selects the AFBC channel order for border colors when the view
+ * format can use AFBC, following panvk_afbc_reswizzle_border_color (MIT). */
+static void
+reswizzle_border_color(VkFormat format, VkClearColorValue *border)
+{
+   if (format == VK_FORMAT_UNDEFINED)
+      return;
+
+   const enum pipe_format pipe_format = vk_format_to_pipe_format(format);
+   if (pan_format_is_yuv(pipe_format) || util_format_is_depth_or_stencil(pipe_format) ||
+       !pan_afbc_supports_format(PAN_ARCH, pipe_format))
+      return;
+
+   const struct util_format_description *desc = util_format_description(pipe_format);
+   if (desc->swizzle[0] == PIPE_SWIZZLE_Z && desc->swizzle[2] == PIPE_SWIZZLE_X) {
+      const uint32_t red = border->uint32[0];
+      border->uint32[0] = border->uint32[2];
+      border->uint32[2] = red;
+   }
+}
+#endif
+
 static void
 pack_sampler(const struct mali_sampler *sampler, const VkSamplerCreateInfo *info,
              struct mali_hw_desc *out)
 {
    const bool aniso = info->anisotropyEnable && info->maxAnisotropy > 1.0f;
+#if PAN_ARCH == 7
    VkFormat border_format;
-   const VkClearColorValue border = vk_sampler_border_color_value(info, &border_format);
+   VkClearColorValue border = vk_sampler_border_color_value(info, &border_format);
+   reswizzle_border_color(border_format, &border);
+#else
+   const VkClearColorValue border = vk_sampler_border_color_value(info, NULL);
+#endif
 
    STATIC_ASSERT(sizeof(*out) == pan_size(SAMPLER));
    pan_cast_and_pack(out, SAMPLER, cfg) {

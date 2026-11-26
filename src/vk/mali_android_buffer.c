@@ -210,6 +210,37 @@ android_yuv_metadata(const struct platform_vector *vector,
                                         count, planes, &info->yuv);
 }
 
+int
+mali_android_find_dmabuf_fd(const native_handle_t *handle, uint64_t minimum_size)
+{
+   if (!handle || handle->version != sizeof(native_handle_t) ||
+       handle->numFds < 1 || handle->numFds > 4)
+      return -1;
+
+   int fd = -1;
+   for (int i = 0; i < handle->numFds; i++) {
+      const int candidate = handle->data[i];
+      char path[64], target[128] = {0};
+      snprintf(path, sizeof(path), "/proc/self/fd/%d", candidate);
+      const ssize_t len = readlink(path, target, sizeof(target) - 1);
+      if (len < 0 || (strncmp(target, "/dmabuf:", 8) &&
+                      strcmp(target, "/dmabuf") &&
+                      strcmp(target, "anon_inode:dmabuf") &&
+                      strcmp(target, "anon_inode:[dmabuf]")))
+         continue;
+
+      struct stat status;
+      if (fstat(candidate, &status) || status.st_size < 0 ||
+          (uint64_t)status.st_size < minimum_size)
+         continue;
+
+      if (fd >= 0)
+         return -1;
+      fd = candidate;
+   }
+   return fd;
+}
+
 VkResult mali_android_buffer_info(const native_handle_t *handle,
                                   struct mali_android_buffer *out)
 {
@@ -224,27 +255,17 @@ VkResult mali_android_buffer_info(const native_handle_t *handle,
        android.height(android.mapper, handle, &height) ||
        android.layers(android.mapper, handle, &layers) ||
        android.format(android.mapper, handle, &info.format) ||
-       !width || !height || layers != 1 || width > UINT32_MAX || height > UINT32_MAX ||
+       !width || !height || !layers || layers > UINT32_MAX ||
+       width > UINT32_MAX || height > UINT32_MAX ||
        !info.allocation_size || (info.usage & AHARDWAREBUFFER_USAGE_PROTECTED_CONTENT))
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    info.width = width; info.height = height; info.layers = layers;
    /* Metadata and gralloc-extra FDs are not GPU memory. No import-by-trial. */
-   for (int i = 0; i < handle->numFds; i++) {
-      char path[64], target[128] = {0};
-      snprintf(path, sizeof(path), "/proc/self/fd/%d", handle->data[i]);
-      ssize_t len = readlink(path, target, sizeof(target)-1);
-      /* readlink may return exactly /dmabuf: when no name is set. */
-      if (len >= 8 && !strncmp(target, "/dmabuf:", 8)) {
-         if (info.fd >= 0) return VK_ERROR_INVALID_EXTERNAL_HANDLE;
-         info.fd = handle->data[i];
-      }
-   }
-   struct stat statbuf;
-   if (info.fd < 0 || fstat(info.fd, &statbuf) || statbuf.st_size < 0 ||
-       (uint64_t)statbuf.st_size < info.allocation_size)
+   info.fd = mali_android_find_dmabuf_fd(handle, info.allocation_size);
+   if (info.fd < 0)
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    if (info.format == AHARDWAREBUFFER_FORMAT_BLOB) {
-      if (height != 1 || !(info.usage & AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER))
+      if (height != 1 || layers != 1 || !(info.usage & AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER))
          return VK_ERROR_INVALID_EXTERNAL_HANDLE;
       *out = info; return VK_SUCCESS;
    }
@@ -256,7 +277,7 @@ VkResult mali_android_buffer_info(const native_handle_t *handle,
    struct platform_vector planes = {0};
    int err = android.planes(android.mapper, handle, &planes);
    VkResult result = VK_ERROR_INVALID_EXTERNAL_HANDLE;
-   if (!err && yuv && android_yuv_metadata(&planes, &info)) {
+   if (!err && yuv && layers == 1 && android_yuv_metadata(&planes, &info)) {
       *out = info;
       result = VK_SUCCESS;
    } else if (!err && !yuv && (char *)planes.end - (char *)planes.begin == sizeof(struct platform_plane)) {
@@ -270,9 +291,24 @@ VkResult mali_android_buffer_info(const native_handle_t *handle,
           p->increment == 8 * util_format_get_blocksize(vk_format_to_pipe_format(mali_android_vk_format(info.format))) &&
           (uint64_t)p->stride <= UINT32_MAX && !(p->stride % 64) &&
           (uint64_t)p->stride * height <= (uint64_t)p->size) {
-         info.offset = p->offset; info.row_stride = p->stride; info.layer_stride = p->size;
-         info.pixel_stride = p->stride / (p->increment / 8);
-         *out = info; result = VK_SUCCESS;
+         /* A single linear RGB plane in a shared dma-buf. Gralloc reports
+          * total allocation size and layer count but no array pitch.
+          * Follow Mesa d850d2ef, accepting only whole, aligned slices
+          * with room for the first plane's offset and visible rows. */
+         const uint64_t layer_stride =
+            layers == 1 ? (uint64_t)p->size : info.allocation_size / layers;
+         if (layers == 1 ||
+             (!(info.allocation_size % layers) && !(layer_stride % 64) &&
+              !(p->offset % 64) &&
+              (uint64_t)p->offset < layer_stride &&
+              (uint64_t)p->stride * height <= layer_stride - p->offset)) {
+            info.offset = p->offset;
+            info.row_stride = p->stride;
+            info.layer_stride = layer_stride;
+            info.pixel_stride = p->stride / (p->increment / 8);
+            *out = info;
+            result = VK_SUCCESS;
+         }
       }
    }
    destroy_planes(&planes);
@@ -329,7 +365,7 @@ VkResult mali_android_image_layout(struct mali_image *image, const struct mali_a
    const VkFormat fmt = mali_android_vk_format(info->format);
    const struct vk_image *vi = &image->vk;
    if (fmt == VK_FORMAT_UNDEFINED || image->plane_count != 1 || vi->image_type != VK_IMAGE_TYPE_2D ||
-       vi->mip_levels != 1 || vi->array_layers != 1 || vi->samples != 1 ||
+       vi->mip_levels != 1 || vi->array_layers != info->layers || vi->samples != 1 ||
        vi->extent.width != info->width || vi->extent.height != info->height ||
        util_format_linear(vk_format_to_pipe_format(vi->format)) != util_format_linear(vk_format_to_pipe_format(fmt)))
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
@@ -339,11 +375,13 @@ VkResult mali_android_image_layout(struct mali_image *image, const struct mali_a
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    struct mali_image_plane_layout layout;
    const struct mali_image_layout_info li = {.format=pf,.modifier=DRM_FORMAT_MOD_LINEAR,
-      .width=info->width,.height=info->height,.depth=1,.samples=1,.levels=1,.layers=1};
+      .width=info->width,.height=info->height,.depth=1,.samples=1,.levels=1,.layers=info->layers};
    if (!mali_image_plane_layout_init(&li, 0, &layout)) return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    layout.slices[0].offset = info->offset;
    layout.slices[0].row_stride = info->row_stride;
-   layout.slices[0].surface_stride = layout.slices[0].size = info->layer_stride;
+   const uint64_t slice_size =
+      info->layers == 1 ? info->layer_stride : info->layer_stride - info->offset;
+   layout.slices[0].surface_stride = layout.slices[0].size = slice_size;
    layout.array_stride = info->layer_stride; layout.data_size = info->allocation_size;
    image->planes[0].layout = layout; image->size = info->allocation_size;
    image->vk.drm_format_mod = DRM_FORMAT_MOD_LINEAR;
@@ -493,6 +531,7 @@ VkResult mali_android_allocate_memory(struct mali_device *dev, const VkMemoryAll
       AHardwareBuffer_Desc desc = {.layers=1};
       if (image) {
          desc.width=image->vk.extent.width; desc.height=image->vk.extent.height;
+         desc.layers=image->vk.array_layers;
          desc.format=mali_android_hal_format(image->vk.format);
          desc.usage=AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT |
                     AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN |

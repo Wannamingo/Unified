@@ -34,8 +34,8 @@ enum mali_memory_type {
    MALI_MEMORY_TYPE_COUNT = 4,
 };
 
-/* memoryTypeBits the blob reports: buffers and ordinary images may use
- * types 0 and 1; transient attachments only the lazily allocated type. */
+/* Buffers and ordinary images can use types 0 and 1. Transient
+ * attachments also have access to lazily allocated memory. */
 #define MALI_MEMORY_TYPES_HOST_VISIBLE \
    ((1u << MALI_MEMORY_TYPE_UNCACHED) | (1u << MALI_MEMORY_TYPE_CACHED))
 #define MALI_MEMORY_TYPES_TRANSIENT (1u << MALI_MEMORY_TYPE_TRANSIENT)

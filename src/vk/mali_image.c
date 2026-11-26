@@ -377,7 +377,10 @@ image_init_layout(struct mali_device *dev, struct mali_image *image,
        (pCreateInfo->usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) ||
        external->handleTypes != VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID ||
        pCreateInfo->imageType != VK_IMAGE_TYPE_2D ||
-       pCreateInfo->mipLevels != 1 || pCreateInfo->arrayLayers != 1 || pCreateInfo->samples != 1 ||
+       pCreateInfo->mipLevels != 1 || !pCreateInfo->arrayLayers ||
+       pCreateInfo->arrayLayers > (mali_api14_lab_arch(pdev->arch) ?
+          pdev->vk.properties.maxImageArrayLayers : 1) ||
+       pCreateInfo->samples != 1 ||
        pCreateInfo->tiling != VK_IMAGE_TILING_OPTIMAL ||
        (!external_yuv && !mali_android_hal_format(pCreateInfo->format)))) {
       result = VK_ERROR_FORMAT_NOT_SUPPORTED; goto fail;
@@ -522,17 +525,21 @@ mali_GetImageMemoryRequirements2(VkDevice _device, const VkImageMemoryRequiremen
 {
    VK_FROM_HANDLE(mali_image, image, pInfo->image);
 
-   /* Memory types as the blob: a transient attachment only in lazily
-    * allocated memory, everything else in the host-visible types. No
-    * disjoint planes, so VkImagePlaneMemoryRequirementsInfo does not
-    * apply. */
+   uint32_t memory_types = MALI_MEMORY_TYPES_HOST_VISIBLE;
+   if (image->ahb || (image->vk.external_handle_types & MALI_EXTERNAL_FD_TYPES)) {
+      memory_types = 1u << MALI_MEMORY_TYPE_EXTERNAL_CACHED;
+   } else if (image->vk.usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) {
+      memory_types = MALI_MEMORY_TYPES_TRANSIENT;
+      /* Linear images must offer a host-visible memory type even when
+       * intended as transient framebuffer attachments. */
+      if (image->vk.tiling == VK_IMAGE_TILING_LINEAR)
+         memory_types |= MALI_MEMORY_TYPES_HOST_VISIBLE;
+   }
+
    pMemoryRequirements->memoryRequirements = (VkMemoryRequirements) {
       .size = image->size,
       .alignment = MALI_IMAGE_ALIGNMENT,
-      .memoryTypeBits = (image->ahb || (image->vk.external_handle_types & MALI_EXTERNAL_FD_TYPES)) ?
-                          (1u << MALI_MEMORY_TYPE_EXTERNAL_CACHED) :
-                       (image->vk.usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) ?
-                           MALI_MEMORY_TYPES_TRANSIENT : MALI_MEMORY_TYPES_HOST_VISIBLE,
+      .memoryTypeBits = memory_types,
    };
 
    vk_foreach_struct(stype, ext, pMemoryRequirements->pNext) {

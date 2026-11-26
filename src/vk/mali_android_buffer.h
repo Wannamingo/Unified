@@ -18,6 +18,7 @@ struct mali_android_buffer {
    uint64_t usage, allocation_size, modifier, offset, row_stride, layer_stride;
 };
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
+int mali_android_find_dmabuf_fd(const struct native_handle *handle, uint64_t minimum_size);
 bool mali_android_buffer_available(void);
 bool mali_android_buffer_acquire(struct AHardwareBuffer *buffer);
 VkResult mali_android_external_image_info(struct mali_device *dev,

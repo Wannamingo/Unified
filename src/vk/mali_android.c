@@ -321,10 +321,15 @@ ahb_blob(struct mali_device *dev, const struct AHardwareBuffer *ahb, int *fd, ui
                        "hardware buffer of format %u: only BLOB buffers are importable",
                        d.format);
    const native_handle_t *h = ahb_handle((const AHardwareBuffer *)ahb);
-   if (!h || h->numFds < 1 || h->data[0] < 0)
+   if (!h || h->version != sizeof(native_handle_t) || h->numFds < 1)
       return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
                        "hardware buffer without a dma-buf fd");
-   *fd = h->data[0];
+   /* Single-fd handles work on legacy kernels without recognizable dma-buf
+    * link names. Multi-fd handles can put gralloc metadata in slot zero. */
+   *fd = h->numFds == 1 ? h->data[0] : mali_android_find_dmabuf_fd(h, d.width);
+   if (*fd < 0)
+      return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                       "hardware buffer without an unambiguous dma-buf fd");
    const int64_t fd_size = mali_dmabuf_fd_size(*fd);
    *size = fd_size > 0 ? (uint64_t)fd_size : d.width;   /* a BLOB's width is its bytes */
    return VK_SUCCESS;

@@ -43,12 +43,22 @@
 #ifndef UNIFIED_API13_LAB
 #define UNIFIED_API13_LAB 0
 #endif
+#ifndef UNIFIED_API14_LAB
+#define UNIFIED_API14_LAB 0
+#endif
 #ifndef UNIFIED_VALIDATION_LAB
 #define UNIFIED_VALIDATION_LAB 0
 #endif
 #define MALI_API_BASE_VERSION VK_MAKE_API_VERSION(0, 1, 1, VK_HEADER_VERSION)
 #define MALI_API_VERSION \
-   VK_MAKE_API_VERSION(0, 1, (UNIFIED_API13_LAB ? 3 : UNIFIED_API12_LAB ? 2 : 1), VK_HEADER_VERSION)
+   VK_MAKE_API_VERSION(0, 1, (UNIFIED_API14_LAB ? 4 : UNIFIED_API13_LAB ? 3 : UNIFIED_API12_LAB ? 2 : 1), \
+                       VK_HEADER_VERSION)
+
+static inline bool
+mali_api14_lab_arch(uint32_t arch)
+{
+   return UNIFIED_API14_LAB && (arch == 7 || arch == 11);
+}
 
 static inline uint32_t
 mali_api_version_for_arch(uint32_t arch)

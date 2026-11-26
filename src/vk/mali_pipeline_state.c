@@ -226,6 +226,20 @@ reads_dest(const struct mali_blend_eq *eq)
           eq->rgb_dst != PIPE_BLENDFACTOR_ZERO || eq->alpha_dst != PIPE_BLENDFACTOR_ZERO;
 }
 
+static bool
+logicop_reads_dest(enum pipe_logicop op)
+{
+   switch (op) {
+   case PIPE_LOGICOP_CLEAR:
+   case PIPE_LOGICOP_SET:
+   case PIPE_LOGICOP_COPY:
+   case PIPE_LOGICOP_COPY_INVERTED:
+      return false;
+   default:
+      return true;
+   }
+}
+
 static enum mali_blend_operand_c
 to_c_factor(enum pipe_blendfactor f)
 {
@@ -431,14 +445,15 @@ pack_blend(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
          continue;
 
       const enum pipe_format pfmt = vk_format_to_pipe_format(format);
+      const bool logicop_active = out->logicop_enable &&
+         !util_format_is_float(pfmt) && !util_format_is_srgb(pfmt);
 
-      /* Logic op NOOP leaves integer and UNORM targets alone (panvk). */
-      if (out->logicop_enable && out->logicop_func == PIPE_LOGICOP_NOOP &&
-          !util_format_is_float(pfmt) && !util_format_is_srgb(pfmt))
+      /* NOOP leaves attachments with active logical operations untouched. */
+      if (logicop_active && out->logicop_func == PIPE_LOGICOP_NOOP)
          continue;
 
       struct mali_blend_eq eq = {
-         .enable = att->blend_enable,
+         .enable = att->blend_enable && !out->logicop_enable,
          .is_float = util_format_is_float(pfmt),
          .rgb_func = vk_blend_op_to_pipe(att->color_blend_op),
          .alpha_func = vk_blend_op_to_pipe(att->alpha_blend_op),
@@ -452,7 +467,10 @@ pack_blend(const struct mali_gfx_pack_input *in, struct mali_gfx_baked *out)
       rt->eq = eq;
 
       rt->srgb = util_format_is_srgb(pfmt);
-      rt->load_destination = reads_dest(&eq);
+      /* Logical operations replace blending, but masked channels still
+       * preserve the current tile contents. FPK needs both dependencies. */
+      rt->load_destination = reads_dest(&eq) ||
+         (logicop_active && logicop_reads_dest(out->logicop_func));
       rt->constant_mask = constant_mask(&eq);
       out->any_dest_read |= rt->load_destination;
 
@@ -757,6 +775,16 @@ draw_mode(enum mesa_prim prim)
       return MALI_DRAW_MODE_TRIANGLE_STRIP;
    case MESA_PRIM_TRIANGLE_FAN:
       return MALI_DRAW_MODE_TRIANGLE_FAN;
+#if PAN_ARCH >= 9
+   case MESA_PRIM_LINES_ADJACENCY:
+      return MALI_DRAW_MODE_LINES_ADJACENCY;
+   case MESA_PRIM_LINE_STRIP_ADJACENCY:
+      return MALI_DRAW_MODE_LINE_STRIP_ADJACENCY;
+   case MESA_PRIM_TRIANGLES_ADJACENCY:
+      return MALI_DRAW_MODE_TRIANGLES_ADJACENCY;
+   case MESA_PRIM_TRIANGLE_STRIP_ADJACENCY:
+      return MALI_DRAW_MODE_TRIANGLE_STRIP_ADJACENCY;
+#endif
    default:
       return MALI_DRAW_MODE_NONE;
    }

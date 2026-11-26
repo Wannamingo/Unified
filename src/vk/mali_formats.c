@@ -40,7 +40,7 @@ mali_ycbcr_enabled(uint32_t arch)
 {
    const bool supported = arch == 11 ||
       (UNIFIED_API13_LAB && UNIFIED_VALIDATION_LAB && (arch == 7 || arch == 9));
-   return supported && debug_get_bool_option("UNIFIED_YUV", false);
+   return supported && debug_get_bool_option("UNIFIED_YUV", mali_api14_lab_arch(arch));
 }
 
 unsigned
@@ -372,7 +372,8 @@ mali_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
     *   tiling or DRM_FORMAT_MOD_LINEAR), not exportable: we cannot allocate
     *   memory another process can open.
     *
-    * Either image has one level, one layer and one sample.
+    * Both import paths use one level and one sample. Typed RGB AHB
+    * images can have multiple layers.
     */
    const VkPhysicalDeviceExternalImageFormatInfo *ext_info =
       vk_find_struct_const(pInfo->pNext, PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO);
@@ -424,7 +425,8 @@ mali_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
    if (ahb || fd || pInfo->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
       VkImageFormatProperties *p = &pProps->imageFormatProperties;
       p->maxMipLevels = 1;
-      p->maxArrayLayers = 1;
+      if (!ahb_importable || !mali_api14_lab_arch(pdev->arch))
+         p->maxArrayLayers = 1;
       p->sampleCounts = VK_SAMPLE_COUNT_1_BIT;
    }
 

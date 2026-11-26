@@ -341,6 +341,7 @@ static const struct vk_device_extension_table mali_device_extensions = {
    .KHR_maintenance5 = UNIFIED_VALIDATION_LAB,
    .KHR_maintenance6 = true,
    .EXT_pipeline_robustness = UNIFIED_VALIDATION_LAB,
+   .EXT_custom_border_color = true,
    .KHR_vertex_attribute_divisor = true,
    /* Sync-file import and export: the Android loader signals present
     * fences by importing the release fence (swapchain_maintenance1). */
@@ -884,6 +885,9 @@ get_features(struct vk_features *f, uint32_t arch)
       /* No minimum revision on v7 or v9: Mesa's model table lists none
        * for the G52, G57 or G68 (it does for the G51 and G72). */
       .samplerAnisotropy = true,
+      .customBorderColors = true,
+      /* Bifrost needs the view format to pack the AFBC channel order. */
+      .customBorderColorWithoutFormat = arch != 7,
       .textureCompressionETC2 = true,
       .textureCompressionASTC_LDR = true,
       .textureCompressionBC = false,  /* bc_formats_complete */
@@ -1136,7 +1140,9 @@ pipeline_cache_uuid(uint8_t out[VK_UUID_SIZE], const char *cache_id, size_t cach
    _mesa_blake3_update(&ctx, &gpu_id, sizeof(gpu_id));
 #if UNIFIED_API12_LAB
    /* Never mix private-lab pipeline data with a normal driver's cache. */
-#if UNIFIED_API13_LAB
+#if UNIFIED_API14_LAB
+   static const char lab_domain[] = "Unified-API14-lab-v1";
+#elif UNIFIED_API13_LAB
    static const char lab_domain[] = "Unified-API13-lab-v1";
 #else
    static const char lab_domain[] = "Unified-API12-lab-v1";
@@ -1175,6 +1181,12 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
    const struct mali_kbase_gpu_props *p = &pdev->props;
    const VkSampleCountFlags samples = mali_physical_device_sample_counts(pdev, 4);
    const bool core13 = vulkan13_lab_for_gpu(p);
+   uint32_t api_version = mali_api_version_for_arch(pdev->arch);
+   if (core13) {
+      const bool core14 = mali_api14_lab_arch(pdev->arch) && pdev->timestamp_hz &&
+                          mali_ycbcr_enabled(pdev->arch) && mali_host_copy_enabled(pdev->arch);
+      api_version = VK_MAKE_API_VERSION(0, 1, core14 ? 4 : 3, VK_HEADER_VERSION);
+   }
    /* Keep the existing byte-aligned view contract. Neither texel descriptor
     * path promises tighter, format-specific single-texel alignment. */
    const VkDeviceSize texel_buffer_alignment = 64;
@@ -1189,6 +1201,7 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
    const bool inline_uniform = vulkan13_shader_and_resource_features_for_arch(pdev->arch);
 
    const uint64_t max_alloc = MIN2(heap_size(p), 8ull << 30);
+   const uint32_t max_samplers = 4000;
    const float ts_period = pdev->timestamp_hz ? 1e9f / (float)pdev->timestamp_hz : 1.0f;
 
    /* The G57 and G52 builds' own identity schemes (above). */
@@ -1196,7 +1209,7 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
    const char *const driver_info = driver_info_for_arch(p->arch_major);
 
    *props = (struct vk_properties) {
-      .apiVersion = core13 ? MALI_API_VERSION : mali_api_version_for_arch(p->arch_major),
+      .apiVersion = api_version,
       .driverVersion = driver_version,
       .vendorID = MALI_VENDOR_ID,
       .deviceID = (uint32_t)p->gpu_id,
@@ -1211,7 +1224,9 @@ get_properties(const struct mali_physical_device *pdev, const char *name,
       .maxTexelBufferElements = 1u << 28,
       .maxStorageBufferRange = 1u << 31,
       .maxMemoryAllocationCount = 16384,
-      .maxSamplerAllocationCount = 4000,
+      .maxSamplerAllocationCount = max_samplers,
+      /* Each sampler descriptor stores its own border color. */
+      .maxCustomBorderColorSamplers = max_samplers,
       .bufferImageGranularity = 1,
       .sparseAddressSpaceSize = 0,
       .maxComputeSharedMemorySize = 32768,

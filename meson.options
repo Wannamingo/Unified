@@ -19,6 +19,9 @@ option(
 option('unified_api13_lab', type : 'boolean', value : false,
   description : 'Private Vulkan 1.3 and SPIR-V 1.6 validation on Mali-G52, Mali-G57 and Mali-G615')
 
+option('unified_api14_lab', type : 'boolean', value : false,
+  description : 'Private Vulkan 1.4 validation on Mali-G52 and Mali-G615')
+
 option('unified_geometry_lab', type : 'boolean', value : false,
   description : 'Enable the experimental CSF geometry shader path')
 

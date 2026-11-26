@@ -30,10 +30,9 @@
  *    draw_helper.cl); here the CPU reads the indices from the index
  *    buffer's mapping (mali_cmd_state.c) when the draw is recorded, so they
  *    must be in place by then and stay unchanged until the draw has run
- *    (index_range lists the writes it cannot see). Not supported, each
- *    logged once with the draw skipped: an index buffer without a CPU
- *    mapping, and indices that a buffer copy, fill or update or an image
- *    to buffer copy recorded earlier in the same command buffer writes;
+ *    (index_range lists the writes it cannot see). When the buffer lacks
+ *    a CPU view or a recorded transfer writes its indices, reuse the
+ *    indirect draw's GPU range calculation for the direct draw;
  *  - descriptor sets: each stage's tables come from the builder the
  *    dispatches use too (mali_jm_desc_v7.c). The vertex shader's images
  *    go behind its vertex attributes, the fragment shader's in the Tiler
@@ -509,14 +508,26 @@ emit_viewport(struct mali_cmd_buffer *cmd)
    return p.gpu;
 }
 
-/* A zero-area Vulkan scissor is empty. Encoding it as an inclusive v7
- * viewport min=max instead produces one pixel. Keep the Vertex job for
- * shader side effects, but do not emit a Tiler job for such a draw. */
+/* Keep the Vertex job for side effects. A zero-area scissor or a shader
+ * without Position produces no fragments. A v7 Tiler job would instead
+ * use an inclusive viewport or dereference a missing position buffer. */
 static bool
-draw_needs_tiler(const struct vk_dynamic_graphics_state *st, const VkRect2D *scissor)
+draw_needs_tiler(const struct mali_jm_draw_tmpl *t,
+                 const struct vk_dynamic_graphics_state *st, const VkRect2D *scissor)
 {
    return !st->rs.rasterizer_discard_enable &&
+          t->vary_stride[MALI_V7_VARY_BUF_POSITION] != 0 &&
           scissor->extent.width != 0 && scissor->extent.height != 0;
+}
+
+static bool
+draw_needs_vertex_job(const struct mali_shader *vs)
+{
+   /* Without Position or shader side effects, this draw has no visible
+    * work on v7, which has no transform feedback or pipeline statistics.
+    * An empty Bifrost shader can have no executable program to fetch. */
+   return (vs->info.outputs_written & BITFIELD64_BIT(VARYING_SLOT_POS)) ||
+          vs->info.writes_global;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1202,7 +1213,7 @@ scan_u32(const uint32_t *idx, uint32_t n, bool restart, uint32_t *min_out, uint3
  * they must be in the buffer by then and stay unchanged until the draw has
  * run: an index outside the range found here makes the Tiler job read
  * positions and varyings the Vertex job did not write. Two cases are
- * caught, logged once and returned as false, and the draw is skipped: an
+ * caught and returned as false for the GPU range calculation: an
  * index buffer without a CPU view, and indices that a transfer recorded
  * earlier in this command buffer writes (mali_v7_note_buffer_write), which
  * runs after this read. Other writes are not detected: by a shader, by
@@ -1220,10 +1231,8 @@ index_range(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, bool r
    const uint32_t size = d->ib.index_size;
 
    *empty = false;
-   if (!t->ib_cpu || !size) {
-      MALI_V7_UNSUPPORTED("an indexed draw whose index buffer has no CPU view");
+   if (!t->ib_cpu || !size)
       return false;
-   }
    const uint64_t first = (uint64_t)di->first_index * size;
    if (first >= d->ib.size) {
       *empty = true;
@@ -1231,11 +1240,8 @@ index_range(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di, bool r
    }
    /* Indices past the end of the bound range are left out of the scan. */
    const uint32_t count = (uint32_t)MIN2(di->count, (d->ib.size - first) / size);
-   if (buffer_written(cmd, d->ib.addr + first, (uint64_t)count * size)) {
-      MALI_V7_UNSUPPORTED("an indexed draw whose indices a transfer earlier in the same "
-                          "command buffer writes");
+   if (buffer_written(cmd, d->ib.addr + first, (uint64_t)count * size))
       return false;
-   }
    const uint8_t *base = t->ib_cpu + first;
    uint32_t min = UINT32_MAX, max = 0;
 
@@ -1369,6 +1375,9 @@ emit_tiler_job(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di,
       mali_v7_link_tilers(cmd, 0);
 }
 
+static void draw_gpu_indexed(struct mali_cmd_buffer *cmd,
+                             const struct mali_draw_info *di);
+
 static void
 draw_one_view(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
 {
@@ -1386,6 +1395,11 @@ draw_one_view(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
       return;
 
    const struct mali_graphics_pipeline *p = d->pipeline;
+   if (!draw_needs_vertex_job(p->vs)) {
+      if (di->indexed)
+         cmd->jm.idx_hint.set = false;
+      return;
+   }
    const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
    /* States the bind does not copy into the command buffer come from the
     * pipeline unless it left them dynamic (mali_cmd_bind_graphics). */
@@ -1397,8 +1411,7 @@ draw_one_view(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
    dd.raw_vertex_offset = di->vertex_offset;
    if (di->indexed) {
       /* The vertex range, from the indices in the buffer at this point
-       * of recording (index_range says what that needs); a draw whose
-       * indices cannot be read here is skipped. */
+       * of recording when they are readable. */
       uint32_t min, max;
       bool empty = false, ok = true;
       const bool hinted = cmd->jm.idx_hint.set && cmd->jm.idx_hint.ib == d->ib.addr &&
@@ -1415,7 +1428,11 @@ draw_one_view(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
          if (unlikely(t_scan))
             mali_cpuprof_part(MALI_CPUPROF_IDXSCAN, t_scan);
       }
-      if (!ok || empty)
+      if (!ok) {
+         draw_gpu_indexed(cmd, di);
+         return;
+      }
+      if (empty)
          return;
       dd.vertex_range = max - min + 1;
       dd.raw_vertex_offset = (int32_t)min + di->vertex_offset;
@@ -1437,7 +1454,7 @@ draw_one_view(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
    }
 
    /* Empty scissor and rasterizer discard still execute the vertex shader. */
-   const bool tiling = draw_needs_tiler(st, &cmd->vk.dynamic_graphics_state.vp.scissors[0]);
+   const bool tiling = draw_needs_tiler(t, st, &cmd->vk.dynamic_graphics_state.vp.scissors[0]);
 
    /* The Invocation of both jobs (panvk_cmd_draw): (1, vertex range,
     * instances) workgroups of one invocation, with the graphics quirks. */
@@ -1647,6 +1664,7 @@ struct idraw_call {
    uint32_t stride;
    uint32_t draws;      /* drawCount, or maxDrawCount */
    uint64_t count;      /* the draw count, 0 for the plain forms */
+   uint32_t first_draw_id;
    bool indexed;
 };
 
@@ -1682,10 +1700,13 @@ draw_indirect(struct mali_cmd_buffer *cmd, const struct idraw_call *call, uint32
    const struct vk_dynamic_graphics_state *st =
       p->bind.dynamic ? &cmd->vk.dynamic_graphics_state : &p->state;
    const struct mali_shader *vs = p->vs;
+   if (!draw_needs_vertex_job(vs))
+      return;
 
    /* Placeholders the patch job replaces: one vertex, one instance. */
    const struct mali_draw_info di = {
-      .count = 1, .instance_count = 1, .indexed = call->indexed, .draw_id = i,
+      .count = 1, .instance_count = 1, .indexed = call->indexed,
+      .draw_id = call->first_draw_id + i,
    };
    struct draw_data dd;
    memset(&dd, 0, sizeof(dd));
@@ -1714,7 +1735,7 @@ draw_indirect(struct mali_cmd_buffer *cmd, const struct idraw_call *call, uint32
    if (!arena)
       return;
 
-   const bool tiling = draw_needs_tiler(st, &cmd->vk.dynamic_graphics_state.vp.scissors[0]);
+   const bool tiling = draw_needs_tiler(t, st, &cmd->vk.dynamic_graphics_state.vp.scissors[0]);
    struct mali_invocation_packed invocation;
    const uint32_t one[3] = {1, 1, 1};
    mali_v7_pack_invocation(&invocation, one, one, true);
@@ -1846,6 +1867,34 @@ fail:
    return;
 oom:
    vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+}
+
+static void
+draw_gpu_indexed(struct mali_cmd_buffer *cmd, const struct mali_draw_info *di)
+{
+   if (!cmd->gfx.draw.ib.size || !cmd->gfx.draw.ib.index_size)
+      return;
+
+   const VkDrawIndexedIndirectCommand args = {
+      .indexCount = di->count,
+      .instanceCount = di->instance_count,
+      .firstIndex = di->first_index,
+      .vertexOffset = di->vertex_offset,
+      .firstInstance = di->first_instance,
+   };
+   struct mali_ptr params = mali_cmd_alloc(cmd, sizeof(args), 4);
+   if (!params.cpu)
+      return;
+   memcpy(params.cpu, &args, sizeof(args));
+
+   const struct idraw_call call = {
+      .cmd = params.gpu,
+      .stride = sizeof(args),
+      .draws = 1,
+      .first_draw_id = di->draw_id,
+      .indexed = true,
+   };
+   draw_indirect(cmd, &call, 0);
 }
 
 static void
