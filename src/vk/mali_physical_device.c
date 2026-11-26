@@ -810,6 +810,8 @@ static void
 get_descriptor_indexing_features(struct vk_features *f, uint32_t arch)
 {
    if (arch == 7) {
+      f->shaderUniformTexelBufferArrayDynamicIndexing = UNIFIED_API13_LAB && UNIFIED_VALIDATION_LAB;
+      f->shaderStorageTexelBufferArrayDynamicIndexing = UNIFIED_API13_LAB && UNIFIED_VALIDATION_LAB;
       f->runtimeDescriptorArray = true;
       f->descriptorBindingPartiallyBound = true;
       f->descriptorBindingSampledImageUpdateAfterBind = true;

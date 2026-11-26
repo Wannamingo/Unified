@@ -453,6 +453,9 @@ load_img_samples(nir_builder *b, struct lower_desc_ctx *ctx, nir_deref_instr *de
    return nir_ishl(b, nir_imm_int(b, 1), samples);
 }
 
+static nir_def *get_img_index(nir_builder *b, nir_deref_instr *deref,
+                              struct lower_desc_ctx *ctx);
+
 static bool
 lower_tex(nir_builder *b, nir_tex_instr *tex, struct lower_desc_ctx *ctx)
 {
@@ -482,6 +485,21 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, struct lower_desc_ctx *ctx)
          break;
       }
       nir_def_replace(&tex->def, res);
+      return true;
+   }
+
+   /* Bifrost fetches buffer texels through the image attribute table.
+    * They do not have a texture plane or belong to a direct texture set. */
+   if (tex->sampler_dim == GLSL_SAMPLER_DIM_BUF) {
+      const int src = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+      assert(tex->op == nir_texop_txf && src >= 0);
+      nir_deref_instr *deref = nir_src_as_deref(tex->src[src].src);
+      nir_tex_instr_remove_src(tex, src);
+      nir_def *index = get_img_index(b, deref, ctx);
+      if (nir_src_is_const(nir_src_for_ssa(index)))
+         tex->texture_index = nir_src_as_uint(nir_src_for_ssa(index));
+      else
+         nir_tex_instr_add_src(tex, nir_tex_src_texture_offset, index);
       return true;
    }
 
@@ -737,7 +755,8 @@ collect_desc_access(nir_builder *b, nir_instr *instr, void *data)
       if (idx >= 0) {
          get_resource_deref_binding(nir_src_as_deref(tex->src[idx].src), &set, &binding,
                                     &index_imm, &index_ssa, &max_idx);
-         record_binding(ctx, set, binding, MALI_SUBDESC_TEXTURE, max_idx);
+         record_binding(ctx, set, binding, tex->sampler_dim == GLSL_SAMPLER_DIM_BUF ?
+                                         MALI_SUBDESC_NONE : MALI_SUBDESC_TEXTURE, max_idx);
          recorded = true;
       }
       return recorded;
@@ -775,6 +794,8 @@ scan_tex_sets(nir_builder *b, nir_instr *instr, void *data)
    if (instr->type != nir_instr_type_tex)
       return false;
    nir_tex_instr *tex = nir_instr_as_tex(instr);
+   if (tex->sampler_dim == GLSL_SAMPLER_DIM_BUF)
+      return false;
    const nir_tex_src_type srcs[2] = {nir_tex_src_sampler_deref, nir_tex_src_texture_deref};
    for (unsigned i = 0; i < 2; i++) {
       const int idx = nir_tex_instr_src_index(tex, srcs[i]);
